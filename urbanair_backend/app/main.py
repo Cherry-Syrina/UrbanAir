@@ -49,12 +49,24 @@ logger = logging.getLogger("urbanair.api")
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def _normalize_origin(origin: str) -> str:
+    """Trim whitespace and trailing slashes from a configured origin.
+
+    Browsers send the ``Origin`` header WITHOUT a trailing slash (e.g.
+    ``https://app.vercel.app``), while an env var is easy to set as
+    ``https://app.vercel.app/``. CORS middleware matches origins literally, so
+    a stray slash or space silently blocks every request. Normalising here
+    makes configuration forgiving without loosening security.
+    """
+    return origin.strip().rstrip("/")
+
+
 def _cors_origins():
     """Restrict CORS to configured origins in production. Defaults to the
     local Vite dev server only -- never a blanket '*' once origins are set."""
     raw = os.environ.get("CORS_ORIGINS", "")
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
-    frontend = os.environ.get("FRONTEND_URL", "").strip()
+    origins = [o for o in (_normalize_origin(p) for p in raw.split(",")) if o]
+    frontend = _normalize_origin(os.environ.get("FRONTEND_URL", ""))
     if frontend and frontend not in origins:
         origins.append(frontend)
     if not origins:
@@ -67,6 +79,7 @@ app = FastAPI(title="UrbanAir AI API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
+    allow_origin_regex=os.environ.get("CORS_ORIGIN_REGEX") or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
