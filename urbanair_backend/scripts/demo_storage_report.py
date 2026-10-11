@@ -45,7 +45,7 @@ def main() -> int:
     if not database.get_database_url():
         print("ERROR: DATABASE_URL (or SUPABASE_DB_URL) is not set.")
         return 1
-    if not database.configure():
+    if not database.configure(null_pool=True):
         print("ERROR: could not create a database engine from DATABASE_URL.")
         return 1
 

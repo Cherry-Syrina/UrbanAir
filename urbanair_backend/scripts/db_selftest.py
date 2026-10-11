@@ -46,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Add the Session Pooler string to urbanair_backend/.env first.")
         return 2
 
-    if not database.configure():
+    if not database.configure(null_pool=True):
         print("FAIL: could not build a database engine from DATABASE_URL.")
         return 1
 

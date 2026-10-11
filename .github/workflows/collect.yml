@@ -54,4 +54,5 @@ jobs:
         working-directory: urbanair_backend
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DB_POOL_MODE: "null"   # one-shot job: don't hold a connection pool
         run: python -m scripts.sync_live_to_db --csv-dir ../aqi_model

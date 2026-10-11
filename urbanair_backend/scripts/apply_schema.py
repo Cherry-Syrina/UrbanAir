@@ -30,7 +30,7 @@ def main() -> int:
         print("Set it in your environment or urbanair_backend/.env first.")
         return 1
 
-    if not database.configure():
+    if not database.configure(null_pool=True):
         print("ERROR: could not create a database engine from DATABASE_URL.")
         return 1
 

@@ -67,7 +67,7 @@ def sync_once(csv_dir: Path) -> dict:
     """Mirror one round of live CSVs into the DB. Returns per-table counts."""
     if not database.is_configured():
         return {"configured": False}
-    if database.get_engine() is None and not database.configure():
+    if not database.configure(null_pool=True):
         return {"configured": False, "error": "engine"}
     database.create_all()
 

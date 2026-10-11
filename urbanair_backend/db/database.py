@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -84,45 +85,116 @@ def _normalize_url(url: str) -> str:
     return url
 
 
-def configure(url: Optional[str] = None, *, echo: bool = False, force: bool = False) -> bool:
-    """(Re)create the engine + session factory. Returns True if configured."""
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _use_null_pool() -> bool:
+    """One-shot scripts (CI sync, seeders) should not hold pooled connections.
+
+    Enabled with ``DB_POOL_MODE=null`` or ``DB_USE_NULL_POOL=1``.
+    """
+    return (
+        os.environ.get("DB_POOL_MODE", "").strip().lower() == "null"
+        or _env_bool("DB_USE_NULL_POOL", False)
+    )
+
+
+# Serializes engine creation so concurrent first requests cannot each build
+# their own engine (and leak a separate pool against Supabase's shared limit).
+_pool_lock = threading.Lock()
+
+
+def configure(url: Optional[str] = None, *, echo: bool = False, force: bool = False,
+              null_pool: Optional[bool] = None) -> bool:
+    """(Re)create the engine + session factory. Returns True if configured.
+
+    Thread-safe and single-engine-per-process: concurrent callers (e.g. many
+    simultaneous API requests on a cold start) share one engine instead of
+    each building their own pool. Supabase counts every client against a
+    shared limit, so this matters.
+
+    Pool defaults are deliberately small and env-tunable:
+    ``DB_POOL_SIZE`` (2), ``DB_MAX_OVERFLOW`` (3), ``DB_POOL_TIMEOUT`` (30),
+    ``DB_POOL_RECYCLE`` (1800), ``DB_POOL_PRE_PING`` (true), ``DB_POOL_USE_LIFO``
+    (true). Set ``DB_POOL_MODE=null`` (or ``DB_USE_NULL_POOL=1``) for one-shot
+    scripts that should release the connection immediately.
+    """
     global _engine, _SessionLocal, _configured_url
 
     url = url or get_database_url()
     if not url:
-        _engine = None
-        _SessionLocal = None
-        _configured_url = None
+        # No URL given and none in the environment: keep an already-built
+        # engine (e.g. tests or a caller configured one programmatically)
+        # rather than tearing it down, unless a reset was explicitly asked for.
+        with _pool_lock:
+            if _engine is not None and not force:
+                return True
+            _engine = None
+            _SessionLocal = None
+            _configured_url = None
         return False
 
-    if _engine is not None and not force and url == _configured_url:
-        return True
+    with _pool_lock:
+        if _engine is not None and not force and url == _configured_url:
+            return True
 
-    kwargs = {"future": True, "echo": echo or os.environ.get("DB_ECHO") == "1"}
+        if null_pool is None:
+            null_pool = _use_null_pool()
 
-    if url.startswith("sqlite"):
-        from sqlalchemy.pool import StaticPool
+        kwargs = {"future": True, "echo": echo or os.environ.get("DB_ECHO") == "1"}
 
-        kwargs["connect_args"] = {"check_same_thread": False}
-        # In-memory SQLite needs a shared static pool so all sessions see the
-        # same database.
-        if ":memory:" in url or url.rstrip("/") == "sqlite:":
-            kwargs["poolclass"] = StaticPool
-    else:
-        kwargs.update(pool_pre_ping=True, pool_recycle=1800, pool_size=5, max_overflow=5)
+        if url.startswith("sqlite"):
+            from sqlalchemy.pool import StaticPool
 
-    try:
-        _engine = create_engine(_normalize_url(url), **kwargs)
-        _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
-        _configured_url = url
-        logger.info("Database configured: %s", _redact(url))
-        return True
-    except Exception as exc:  # pragma: no cover - configuration error path
-        logger.error("Failed to configure database engine: %s", str(exc)[:200])
-        _engine = None
-        _SessionLocal = None
-        _configured_url = None
-        return False
+            kwargs["connect_args"] = {"check_same_thread": False}
+            # In-memory SQLite needs a shared static pool so all sessions see the
+            # same database.
+            if ":memory:" in url or url.rstrip("/") == "sqlite:":
+                kwargs["poolclass"] = StaticPool
+        elif null_pool:
+            from sqlalchemy.pool import NullPool
+
+            kwargs["poolclass"] = NullPool
+        else:
+            kwargs.update(
+                pool_pre_ping=_env_bool("DB_POOL_PRE_PING", True),
+                pool_recycle=_env_int("DB_POOL_RECYCLE", 1800),
+                pool_size=_env_int("DB_POOL_SIZE", 2),
+                max_overflow=_env_int("DB_MAX_OVERFLOW", 3),
+                pool_timeout=_env_int("DB_POOL_TIMEOUT", 30),
+                pool_use_lifo=_env_bool("DB_POOL_USE_LIFO", True),
+            )
+
+        # Never leak the previous engine's connections when replacing it.
+        if _engine is not None:
+            try:
+                _engine.dispose()
+            except Exception:  # pragma: no cover
+                pass
+
+        try:
+            _engine = create_engine(_normalize_url(url), **kwargs)
+            _SessionLocal = sessionmaker(bind=_engine, autoflush=False, autocommit=False, future=True)
+            _configured_url = url
+            logger.info("Database configured: %s", _redact(url))
+            return True
+        except Exception as exc:  # pragma: no cover - configuration error path
+            logger.error("Failed to configure database engine: %s", str(exc)[:200])
+            _engine = None
+            _SessionLocal = None
+            _configured_url = None
+            return False
 
 
 def is_configured() -> bool:
@@ -185,11 +257,12 @@ def health() -> dict:
 def reset() -> None:
     """Tear down the engine (used by tests)."""
     global _engine, _SessionLocal, _configured_url
-    if _engine is not None:
-        try:
-            _engine.dispose()
-        except Exception:  # pragma: no cover
-            pass
-    _engine = None
-    _SessionLocal = None
-    _configured_url = None
+    with _pool_lock:
+        if _engine is not None:
+            try:
+                _engine.dispose()
+            except Exception:  # pragma: no cover
+                pass
+        _engine = None
+        _SessionLocal = None
+        _configured_url = None

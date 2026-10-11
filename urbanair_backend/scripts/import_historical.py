@@ -70,7 +70,7 @@ def run_import(csv_path: Path, batch_size: int = 5000, limit: int = 0,
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     if not dry_run:
-        if database.get_engine() is None and not database.configure():
+        if not database.configure(null_pool=True):
             raise RuntimeError("Database is not configured (set DATABASE_URL).")
         if create_tables:
             database.create_all()
