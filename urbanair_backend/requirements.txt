@@ -2,7 +2,11 @@ fastapi
 uvicorn[standard]
 pandas
 numpy
-scikit-learn
+# Pinned to the version the model artifacts were saved with: both
+# models/city_encoder.pkl and models_forecast/city_encoder.pkl record
+# scikit-learn 1.8.0 (_sklearn_version). A newer major/minor can break
+# unpickling of these estimators, so do not bump without retraining.
+scikit-learn==1.8.0
 lightgbm
 catboost
 joblib

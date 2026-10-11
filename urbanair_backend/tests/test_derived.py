@@ -12,6 +12,7 @@ Offline: in-memory SQLite + a temp CSV dir; no Supabase, no network.
 """
 
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -65,6 +66,33 @@ class TestForecastEngine(TestCase):
         for f in payload["forecasts"]:
             self.assertIsNotNone(f["predicted_aqi"])
             self.assertIn(f["predicted_category"], forecast_engine.AQI_CATEGORY_COLORS)
+
+
+class TestForecastEngineDependencies(TestCase):
+    """Guards the exact failure seen in CI: forecast_engine unpickles
+    models_forecast/city_encoder.pkl, a scikit-learn LabelEncoder, which
+    requires scikit-learn to be installed at a compatible version."""
+
+    def test_city_encoder_loads_and_transforms(self):
+        encoder = forecast_engine._load_artifacts()[1]
+        codes = encoder.transform(["Delhi"])
+        self.assertEqual(len(codes), 1)
+
+    def test_requirements_pin_matches_artifact_sklearn_version(self):
+        pinned = None
+        for raw in (BACKEND_DIR / "requirements.txt").read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("scikit-learn"):
+                self.assertIn("==", line,
+                              "scikit-learn must be pinned to the artifact's version")
+                pinned = line.split("==", 1)[1].split(";")[0].strip()
+        self.assertIsNotNone(pinned, "requirements.txt must declare scikit-learn")
+
+        raw = (forecast_engine.MODELS_FORECAST_DIR / "city_encoder.pkl").read_bytes()
+        recorded = {m.decode() for m in re.findall(rb"\b\d+\.\d+\.\d+\b", raw)}
+        self.assertIn(pinned, recorded,
+                      f"pinned scikit-learn {pinned} does not match the version "
+                      f"the encoder was saved with {sorted(recorded)}")
 
 
 class TestPersistDerived(TestCase):

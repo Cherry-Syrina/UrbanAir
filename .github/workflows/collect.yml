@@ -60,8 +60,13 @@ jobs:
       # Forecasts + source-attribution are DERIVED from the collected CSVs.
       # The web service has no CSVs, so it reads these persisted tables for
       # /api/forecast, /api/health-advisory and /api/source-attribution.
-      - name: Install forecast deps (LightGBM) for derived persistence
-        run: pip install joblib lightgbm
+      #
+      # forecast_engine loads models_forecast/city_encoder.pkl, a scikit-learn
+      # LabelEncoder saved with scikit-learn 1.8.0 -- so scikit-learn must be
+      # installed, pinned to that exact version (a newer major/minor can break
+      # unpickling). Do not bump without retraining the models.
+      - name: Install forecast deps (scikit-learn pinned, LightGBM) for derived persistence
+        run: pip install joblib lightgbm "scikit-learn==1.8.0"
 
       - name: Compute + persist derived data (forecasts, source attribution)
         working-directory: urbanair_backend
