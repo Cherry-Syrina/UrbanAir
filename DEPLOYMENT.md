@@ -177,6 +177,14 @@ imports nothing new. The original CSV is never modified.
 |---|---|---|---|
 | `processed_aqi_data.csv` via `scripts.import_historical` | `aqi_readings` (+ `stations`) | `processed_dataset` | `UNIQUE (station_id, observed_at, source)` — re-runs skip existing rows |
 | `live_*.csv` via `scripts.sync_live_to_db` | `aqi_readings`, `weather_readings` | `waqi` / `owm` | same unique key per source |
+| the same `live_*.csv` via `scripts.persist_derived` | `aqi_forecasts`, `pollution_source_estimates` | — | forecasts unique per (station, target_at, horizon, model_id); attribution unique per (station, hour) |
+
+`scripts.persist_derived` is the step that populates the **derived** tables in
+the free GitHub Actions setup (§ "Keeping data fresh"). The deployed web
+service has no collector CSVs, so without it `/api/forecast`,
+`/api/health-advisory` and `/api/source-attribution` return 503. It reuses the
+live endpoint's own forecast model/features (`forecast_engine`) rather than a
+second implementation.
 
 - Import the **historical** CSV once. It only contains the 5 trained
   cities for 2019–2024; it is the correct, appropriate backfill.

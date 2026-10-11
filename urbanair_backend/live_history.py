@@ -1,12 +1,27 @@
 
 
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
-LIVE_POLLUTANTS_LOG = BASE_DIR / "live_pollutants_log.csv"
-LIVE_GROUND_AQI_LOG = BASE_DIR / "live_ground_aqi_log.csv"
+
+# The collector CSVs normally sit next to the backend. A headless process (the
+# GitHub Actions sync job) can point at the directory the collectors wrote to
+# via URBANAIR_LIVE_CSV_DIR instead of copying files around.
+def data_dir() -> Path:
+    override = os.environ.get("URBANAIR_LIVE_CSV_DIR")
+    return Path(override) if override else BASE_DIR
+
+
+def live_pollutants_log() -> Path:
+    return data_dir() / "live_pollutants_log.csv"
+
+
+def live_ground_aqi_log() -> Path:
+    return data_dir() / "live_ground_aqi_log.csv"
+
 
 REQUIRED_HOURS_FOR_FULL_FORECAST = 168  # 7 days -- see module docstring
 
@@ -25,8 +40,8 @@ def get_live_history() -> pd.DataFrame:
     """Builds the live, hourly-resampled history across all cities. Reads
     both CSVs fresh every call -- always reflects whatever the collectors
     have written so far, no restart needed."""
-    aqi_df = _load_csv_safe(LIVE_GROUND_AQI_LOG)
-    poll_df = _load_csv_safe(LIVE_POLLUTANTS_LOG)
+    aqi_df = _load_csv_safe(live_ground_aqi_log())
+    poll_df = _load_csv_safe(live_pollutants_log())
 
     if aqi_df.empty:
         return pd.DataFrame(columns=[

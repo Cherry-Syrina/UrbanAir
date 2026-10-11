@@ -31,6 +31,9 @@ from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
+
+import forecast_engine
+from forecast_engine import AQI_CATEGORY_COLORS, aqi_category_from_value
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -93,9 +96,8 @@ nowcast_classifier = joblib.load(BASE_DIR / "models" / "aqi_classifier.pkl")
 nowcast_city_encoder = joblib.load(BASE_DIR / "models" / "city_encoder.pkl")
 nowcast_meta = json.load(open(BASE_DIR / "models" / "metadata.json"))
 
-forecast_models = {h: joblib.load(BASE_DIR / "models_forecast" / f"forecast_{h}h.pkl") for h in [24, 48, 72]}
-forecast_city_encoder = joblib.load(BASE_DIR / "models_forecast" / "city_encoder.pkl")
-forecast_meta = json.load(open(BASE_DIR / "models_forecast" / "metadata.json"))
+# Forecast models/features now live in forecast_engine (shared with the
+# headless sync job so persisted forecasts match the live endpoint exactly).
 
 # NOTE: processed_aqi_data.csv (frozen at Jan 2024) is no longer loaded here.
 # /api/forecast and /api/historical now build their input from live_history.py,
@@ -107,11 +109,6 @@ CITY_COORDS = {
     "Ghaziabad": (28.6692, 77.4538),
     "Gurgaon": (28.4595, 77.0266),
     "Noida": (28.5355, 77.3910),
-}
-
-AQI_CATEGORY_COLORS = {
-    "Good": "#00A65A", "Satisfactory": "#8CC63F", "Moderate": "#FFC107",
-    "Poor": "#FF7A00", "Very Poor": "#D9534F", "Severe": "#7B1F1F",
 }
 
 GEOJSON_FILES = {
@@ -136,60 +133,6 @@ class NowcastRequest(BaseModel):
     so2: float
     timestamp: Optional[str] = None  # ISO format; defaults to now
 
-
-# ---------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------
-def aqi_category_from_value(aqi_val: float) -> str:
-    if aqi_val <= 50:
-        return "Good"
-    elif aqi_val <= 100:
-        return "Satisfactory"
-    elif aqi_val <= 200:
-        return "Moderate"
-    elif aqi_val <= 300:
-        return "Poor"
-    elif aqi_val <= 400:
-        return "Very Poor"
-    return "Severe"
-
-
-def build_forecast_features_for_row(city_df: pd.DataFrame, idx: int) -> dict:
-    row = city_df.iloc[idx]
-    aqi_series = city_df["aqi"]
-
-    def safe_shift(offset):
-        j = idx - offset
-        return float(aqi_series.iloc[j]) if j >= 0 else np.nan
-
-    shifted = aqi_series.shift(1)
-    feats = {
-        "aqi_lag_1h": safe_shift(1),
-        "aqi_lag_24h": safe_shift(24),
-        "aqi_lag_48h": safe_shift(48),
-        "aqi_lag_72h": safe_shift(72),
-        "aqi_lag_168h": safe_shift(168),
-        "aqi_roll_mean_24h": shifted.iloc[max(0, idx - 24):idx].mean() if idx >= 24 else np.nan,
-        "aqi_roll_std_24h": shifted.iloc[max(0, idx - 24):idx].std() if idx >= 24 else np.nan,
-        "aqi_roll_mean_168h": shifted.iloc[max(0, idx - 168):idx].mean() if idx >= 168 else np.nan,
-        "aqi_roll_max_24h": shifted.iloc[max(0, idx - 24):idx].max() if idx >= 24 else np.nan,
-        "aqi_trend_6h": (safe_shift(1) - safe_shift(7)) if idx >= 7 else np.nan,
-        "pm25_lag_24h": float(city_df["pm25"].iloc[idx - 24]) if idx >= 24 else np.nan,
-        "pm25_roll_mean_24h": city_df["pm25"].shift(1).iloc[max(0, idx - 24):idx].mean() if idx >= 24 else np.nan,
-        "pm10_lag_24h": float(city_df["pm10"].iloc[idx - 24]) if idx >= 24 else np.nan,
-        "pm10_roll_mean_24h": city_df["pm10"].shift(1).iloc[max(0, idx - 24):idx].mean() if idx >= 24 else np.nan,
-        "hour_sin": np.sin(2 * np.pi * row["hour"] / 24),
-        "hour_cos": np.cos(2 * np.pi * row["hour"] / 24),
-        "month_sin": np.sin(2 * np.pi * row["month"] / 12),
-        "month_cos": np.cos(2 * np.pi * row["month"] / 12),
-        "dow_sin": np.sin(2 * np.pi * row["day_of_week"] / 7),
-        "dow_cos": np.cos(2 * np.pi * row["day_of_week"] / 7),
-        "is_weekend": row["is_weekend"],
-        "location_lat": row["location_lat"],
-        "location_lon": row["location_lon"],
-        "year": row["year"],
-    }
-    return feats
 
 
 # ---------------------------------------------------------------
@@ -489,7 +432,7 @@ def _forecast_from_stored(city: str, stored: list) -> dict:
         "reference_time": reference_time,
         "current_aqi": None,
         "forecasts": forecasts,
-        "model_metrics": forecast_meta["metrics"],
+        "model_metrics": forecast_engine.forecast_metrics(),
         "data_maturity": None,
         "data_origin": "database_stored_forecast",
     }
@@ -529,47 +472,7 @@ def forecast(city: str, reference_time: Optional[str] = None, persist: bool = Tr
             f"and persisted."
         )
 
-    if reference_time:
-        target_ts = pd.to_datetime(reference_time)
-        idx = int((city_df["timestamp"] - target_ts).abs().idxmin())
-    else:
-        idx = len(city_df) - 1
-
-    hours_available = idx + 1
-    data_maturity = {
-        "hours_available": hours_available,
-        "hours_needed_for_full_accuracy": live_history.REQUIRED_HOURS_FOR_FULL_FORECAST,
-        "is_warming_up": hours_available < live_history.REQUIRED_HOURS_FOR_FULL_FORECAST,
-    }
-
-    feats = build_forecast_features_for_row(city_df, idx)
-    feats["city_code"] = forecast_city_encoder.transform([city])[0]
-    X = pd.DataFrame([feats])[forecast_meta["features"]]
-
-    current_aqi = float(city_df.loc[idx, "aqi"])
-    reference_ts = city_df.loc[idx, "timestamp"].isoformat()
-
-    predictions = []
-    for h in [24, 48, 72]:
-        pred = float(forecast_models[h].predict(X)[0])
-        future_idx = idx + h
-        actual = float(city_df.loc[future_idx, "aqi"]) if future_idx < len(city_df) else None
-        predictions.append({
-            "horizon_hours": h,
-            "predicted_aqi": round(pred, 1),
-            "predicted_category": aqi_category_from_value(pred),
-            "color": AQI_CATEGORY_COLORS.get(aqi_category_from_value(pred), "#888888"),
-            "actual_aqi": round(actual, 1) if actual is not None else None,
-        })
-
-    payload = {
-        "city": city,
-        "reference_time": reference_ts,
-        "current_aqi": round(current_aqi, 1),
-        "forecasts": predictions,
-        "model_metrics": forecast_meta["metrics"],
-        "data_maturity": data_maturity,
-    }
+    payload = forecast_engine.build_forecast_payload(city, city_df, reference_time)
     # Persist generated forecasts to Supabase when available (no-op otherwise,
     # and duplicate-safe via the forecast unique constraint).
     if persist:

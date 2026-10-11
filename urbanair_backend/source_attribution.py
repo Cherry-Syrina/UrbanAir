@@ -2,12 +2,21 @@
 
 import json
 import math
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
 import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def data_dir() -> Path:
+    """Directory holding the collector CSVs (traffic_log.csv /
+    weather_current_log.csv). Defaults to the backend dir; a headless process
+    can override it with URBANAIR_LIVE_CSV_DIR."""
+    override = os.environ.get("URBANAIR_LIVE_CSV_DIR")
+    return Path(override) if override else BASE_DIR
 
 CITY_COORDS = {
     # 5 cities with trained nowcast/forecast models
@@ -300,8 +309,9 @@ def compute_whatif(attribution_result, current_aqi, reductions):
 
 
 def run_for_all_points():
-    traffic_log = pd.read_csv(BASE_DIR / "traffic_log.csv", parse_dates=["timestamp"])
-    weather_log = pd.read_csv(BASE_DIR / "weather_current_log.csv", parse_dates=["fetch_timestamp"])
+    csv_dir = data_dir()
+    traffic_log = pd.read_csv(csv_dir / "traffic_log.csv", parse_dates=["timestamp"])
+    weather_log = pd.read_csv(csv_dir / "weather_current_log.csv", parse_dates=["fetch_timestamp"])
 
     latest_traffic_ts = traffic_log["timestamp"].max()
     latest_traffic = traffic_log[traffic_log["timestamp"] == latest_traffic_ts]

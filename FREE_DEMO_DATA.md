@@ -29,7 +29,17 @@ A ready-to-use workflow is included at `.github/workflows/collect.yml`. It:
 1. runs every 30 minutes (and on demand via **Actions → Run workflow**),
 2. runs each collector **once** (`--loop` defaults to `0` = run once),
 3. mirrors the resulting CSVs into Supabase with the idempotent
-   `scripts.sync_live_to_db`.
+   `scripts.sync_live_to_db` (the latest AQI + weather reading per station),
+4. computes the **derived** artifacts from the same CSVs and persists them
+   with `scripts.persist_derived`: the 24/48/72h **forecasts** (`aqi_forecasts`)
+   and the rule-based **source attribution** (`pollution_source_estimates`).
+
+Step 4 is what makes `/api/forecast`, `/api/health-advisory` and
+`/api/source-attribution` work in the deployed web service: it has no CSVs of
+its own, so without this step those tables stay empty and the endpoints return
+503. Forecasts here use the exact model + feature builder the live endpoint
+uses (`forecast_engine`), so a persisted row is what `/api/forecast` would have
+returned had the CSVs been present.
 
 **One-time setup:** repo → *Settings → Secrets and variables → Actions → New
 repository secret*, add:

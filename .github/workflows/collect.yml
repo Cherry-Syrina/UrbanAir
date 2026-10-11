@@ -56,3 +56,16 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DB_POOL_MODE: "null"   # one-shot job: don't hold a connection pool
         run: python -m scripts.sync_live_to_db --csv-dir ../aqi_model
+
+      # Forecasts + source-attribution are DERIVED from the collected CSVs.
+      # The web service has no CSVs, so it reads these persisted tables for
+      # /api/forecast, /api/health-advisory and /api/source-attribution.
+      - name: Install forecast deps (LightGBM) for derived persistence
+        run: pip install joblib lightgbm
+
+      - name: Compute + persist derived data (forecasts, source attribution)
+        working-directory: urbanair_backend
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DB_POOL_MODE: "null"   # one-shot job: don't hold a connection pool
+        run: python -m scripts.persist_derived --csv-dir ../aqi_model
