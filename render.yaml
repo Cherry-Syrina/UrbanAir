@@ -1,0 +1,73 @@
+# =============================================================================
+# Render Blueprint for UrbanAir AI
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Creates:
+#   1. urbanair-backend — FastAPI + ML inference web service (reads Supabase)
+#
+# Data collection in FREE mode is handled by GitHub Actions cron
+# (.github/workflows/collect.yml) — see FREE_DEMO_DATA.md. The paid Render
+# Background Worker is kept commented out below so applying this blueprint
+# does NOT provision a billable service.
+#
+# The frontend is deployed separately on Vercel (see DEPLOYMENT.md).
+# Secrets are declared with `sync: false` — set their values in the Render
+# dashboard, never in this file.
+# =============================================================================
+
+services:
+  - type: web
+    name: urbanair-backend
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: urbanair_backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DATABASE_URL
+        sync: false          # Supabase connection string (pooler, sslmode=require)
+      - key: CORS_ORIGINS
+        sync: false          # e.g. https://your-app.vercel.app
+      - key: FRONTEND_URL
+        sync: false          # e.g. https://your-app.vercel.app
+      - key: GROQ_API_KEY
+        sync: false
+      - key: SMTP_EMAIL
+        sync: false
+      - key: SMTP_APP_PASSWORD
+        sync: false
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "465"
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL (PAID): continuously-running collector worker.
+  # Free Background Workers are not offered by Render. For the free demo use
+  # the GitHub Actions cron in .github/workflows/collect.yml instead.
+  # Uncomment the block below ONLY if you intend to pay for a always-on worker.
+  # ---------------------------------------------------------------------------
+  # - type: worker
+  #   name: urbanair-collector
+  #   runtime: python
+  #   plan: starter          # Background Workers are not on the free tier
+  #   region: singapore
+  #   buildCommand: pip install -r urbanair_backend/requirements.txt
+  #   startCommand: python aqi_model/run_all.py
+  #   autoDeploy: false
+  #   envVars:
+  #     - key: PYTHON_VERSION
+  #       value: "3.11.9"
+  #     - key: DATABASE_URL
+  #       sync: false          # same Supabase connection string as the web service
+  #     - key: OWM_API_KEY
+  #       sync: false
+  #     - key: TOMTOM_API_KEY
+  #       sync: false
+  #     - key: WAQI_API_TOKEN
+  #       sync: false

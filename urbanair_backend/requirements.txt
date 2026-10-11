@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pandas
+numpy
+scikit-learn
+lightgbm
+catboost
+joblib
+pydantic
+python-dotenv
+requests
+rasterio
+sqlalchemy>=2.0
+psycopg2-binary

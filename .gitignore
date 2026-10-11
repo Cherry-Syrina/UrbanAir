@@ -1,0 +1,58 @@
+# Python
+venv/
+.venv/
+env/
+
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Node
+node_modules/
+
+# Caches / build artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Nested duplicate copy of the whole project (not part of the deliverable)
+/urbanair_full_stack/
+
+# Large raw OSM intermediate (not used at runtime; the served "roads" layer is
+# urbanair_backend/delhi_ncr_major_roads.geojson). Regenerable via
+# aqi_model/extract_osm_layers.py.
+delhi_ncr_roads.geojson
+
+# Vercel
+.vercel/
+
+# VS Code
+.vscode/
+
+# Build
+dist/
+build/
+
+# Logs
+*.log
+
+# Generated CSV files
+live_ground_aqi_log.csv
+live_pollutants_log.csv
+weather_current_log.csv
+weather_forecast_log.csv
+traffic_log.csv
+processed_aqi_data.csv
+
+# Operating System
+.DS_Store
+Thumbs.db

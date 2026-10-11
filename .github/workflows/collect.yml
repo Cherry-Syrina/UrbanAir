@@ -1,0 +1,57 @@
+name: collect-and-sync
+
+# Keeps genuine live AQI/traffic/weather data flowing into Supabase for the
+# FREE demo, without a Render Background Worker (those are paid). GitHub
+# Actions scheduled runs are free (2,000 min/month on private repos,
+# unlimited on public repos).
+#
+# Setup (one time): repo → Settings → Secrets and variables → Actions → add
+#   TOMTOM_API_KEY, OWM_API_KEY, WAQI_API_TOKEN, DATABASE_URL
+# See FREE_DEMO_DATA.md for the full explanation.
+
+on:
+  schedule:
+    # Every 30 minutes. NOTE: GitHub cron can be delayed several minutes at
+    # busy times; that is fine for a demo.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # lets you run it on demand from the Actions tab
+
+concurrency:
+  group: collect-and-sync
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install collector deps
+        run: pip install requests python-dotenv
+
+      - name: Run each collector once (writes live_*.csv in aqi_model/)
+        working-directory: aqi_model
+        env:
+          OWM_API_KEY: ${{ secrets.OWM_API_KEY }}
+          TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+          WAQI_API_TOKEN: ${{ secrets.WAQI_API_TOKEN }}
+        run: |
+          python air_pollution_collector.py
+          python traffic_collector.py
+          python weather_collector.py
+          python waqi_aqi_collector.py
+
+      - name: Install backend deps needed by the sync
+        run: pip install sqlalchemy psycopg2-binary pandas python-dotenv
+
+      - name: Mirror the fresh CSVs into Supabase (idempotent)
+        working-directory: urbanair_backend
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m scripts.sync_live_to_db --csv-dir ../aqi_model
