@@ -13,7 +13,7 @@ on:
   schedule:
     # Every 30 minutes. NOTE: GitHub cron can be delayed several minutes at
     # busy times; that is fine for a demo.
-    - cron: "*/30 * * * *"
+    - cron: "0 3 * * *"
   workflow_dispatch: {}   # lets you run it on demand from the Actions tab
 
 concurrency:
