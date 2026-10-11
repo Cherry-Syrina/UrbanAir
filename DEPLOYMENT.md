@@ -9,7 +9,7 @@ Target architecture:
 │  (frontend)     │  ◀─────────────────────────────── │  (backend)           │
 └─────────────────┘                                    └──────────┬───────────┘
                                                                   │ SQLAlchemy
-                                                                  │ (psycopg2, SSL)
+                                                                   │ (psycopg, SSL)
                                                        ┌──────────▼───────────┐
                                                        │  Supabase Postgres   │
                                                        └──────────▲───────────┘
@@ -141,7 +141,7 @@ Before applying anything, check the current state with the safe self-test
 
 ```powershell
 cd urbanair_backend
-python -m pip install psycopg2-binary   # required PostgreSQL driver
+python -m pip install "psycopg[binary]" psycopg2-binary   # required PostgreSQL drivers
 python -m scripts.db_selftest           # connect + list tables + row counts
 python -m scripts.db_selftest --write-test   # also proves write access (rolled back)
 ```
@@ -362,6 +362,7 @@ render, and the browser Network tab shows calls to the Render backend
 | 503 on `/api/current/{city}` | No live reading yet — collectors haven't logged. Run/await the worker. |
 | 503 on `/api/aqi/history` | DB not configured (expected in CSV-only mode). |
 | `psycopg2` build error on install | Use `psycopg2-binary` (already in requirements). |
+| `No module named 'psycopg'` in Actions/Render | `DATABASE_URL` uses `postgresql+psycopg://`; install `psycopg[binary]` (already in requirements.txt). |
 | Render worker crashes with `ModuleNotFoundError: db` | Run the sync via `python -m scripts.sync_live_to_db` from `urbanair_backend/`. |
 
 ---

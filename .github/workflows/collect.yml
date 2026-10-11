@@ -48,7 +48,7 @@ jobs:
           python waqi_aqi_collector.py
 
       - name: Install backend deps needed by the sync
-        run: pip install sqlalchemy psycopg2-binary pandas python-dotenv
+        run: pip install sqlalchemy "psycopg[binary]" psycopg2-binary pandas python-dotenv
 
       - name: Mirror the fresh CSVs into Supabase (idempotent)
         working-directory: urbanair_backend
