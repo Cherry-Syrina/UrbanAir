@@ -11,10 +11,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from . import models
+
+# Pollutant concentration columns on aqi_readings (no NOx column exists --
+# OWM/CPCB feeds here report NO and NO2 separately, so NOx is not measured).
+_POLLUTANT_COLS = ("co", "no2", "o3", "pm10", "pm25", "so2")
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +266,28 @@ def get_latest_reading(session, station_name: str) -> Optional[dict]:
         select(models.AqiReading)
         .join(models.Station, models.AqiReading.station_id == models.Station.id)
         .where(models.Station.name == station_name)
+        .order_by(models.AqiReading.observed_at.desc())
+        .limit(1)
+    )
+    row = session.execute(stmt).scalars().first()
+    return _aqi_to_dict(row) if row is not None else None
+
+
+def get_latest_pollutant_reading(session, station_name: str) -> Optional[dict]:
+    """Most recent stored observation for a station that has at least one
+    genuine pollutant concentration.
+
+    The newest row overall is often an AQI-only feed (e.g. the WAQI ground-AQI
+    collector) whose pollutant columns are all null, while the real
+    concentrations sit in a separate, near-simultaneous row (e.g. the OWM
+    nowcast feed). This returns the latest row that actually carries a
+    concentration so the two can be combined without inventing values.
+    Returns None when no row has any pollutant measurement."""
+    has_any = or_(*[getattr(models.AqiReading, c).isnot(None) for c in _POLLUTANT_COLS])
+    stmt = (
+        select(models.AqiReading)
+        .join(models.Station, models.AqiReading.station_id == models.Station.id)
+        .where(models.Station.name == station_name, has_any)
         .order_by(models.AqiReading.observed_at.desc())
         .limit(1)
     )

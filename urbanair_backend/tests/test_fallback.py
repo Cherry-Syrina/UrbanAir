@@ -434,3 +434,113 @@ class TestForecastGrouping(FallbackTestCase):
         self.assertEqual(resp.status_code, 200)
         horizons = [f["horizon_hours"] for f in resp.json()["forecasts"]]
         self.assertEqual(horizons, [24, 48])
+
+
+class TestForecastCurrentAqi(FallbackTestCase):
+    """`/api/forecast/{city}` must report the same current AQI as
+    `/api/current/{city}` -- stored-forecast payloads had current_aqi=None."""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from app import main
+        return TestClient(main.app), main
+
+    def test_stored_forecast_fills_current_aqi_from_current_source(self):
+        client, main = self._client()
+        with patch.object(main, "_load_latest_live_pollutants", return_value=None), \
+                patch.object(main, "_load_latest_ground_aqi", return_value=None), \
+                patch.object(main.live_history, "get_live_history",
+                             return_value=_empty_live()):
+            fc = client.get("/api/forecast/Delhi")
+            cur = client.get("/api/current/Delhi")
+        self.assertEqual(fc.status_code, 200)
+        self.assertEqual(cur.status_code, 200)
+        body = fc.json()
+        self.assertEqual(body["data_origin"], "database_stored_forecast")
+        self.assertEqual(body["current_aqi"], cur.json()["aqi"])
+        self.assertEqual(body["current_aqi"], 202.0)
+        self.assertEqual(body["current_aqi_origin"], "stored_observation")
+
+
+class TestPollutantCards(FallbackTestCase):
+    """Pollutant cards must show genuine measurements only; a separate,
+    near-simultaneous AQI-only feed (WAQI) + concentration feed (OWM nowcast)
+    must be merged, and everything else must read "unavailable" (null), never
+    a fake number."""
+
+    _POLL = ["co", "no2", "o3", "pm10", "pm25", "so2"]
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from app import main
+        return TestClient(main.app), main
+
+    def _stored_only(self, main):
+        return (
+            patch.object(main, "_load_latest_live_pollutants", return_value=None),
+            patch.object(main, "_load_latest_ground_aqi", return_value=None),
+        )
+
+    def _seed_reading(self, city, lat, lon, observed_at, aqi, source, pollutants=None):
+        session = database.get_session()
+        sid = repository.ensure_station(session, city, lat, lon)
+        row = {
+            "station_id": sid, "observed_at": observed_at,
+            "aqi": aqi, "aqi_category": "Moderate" if aqi is not None else None,
+            "source": source,
+        }
+        for k in self._POLL:
+            row[k] = (pollutants or {}).get(k)
+        repository.save_aqi_readings(session, [row])
+        session.commit()
+        session.close()
+
+    def test_stored_observation_returns_genuine_pollutants(self):
+        client, main = self._client()
+        p1, p2 = self._stored_only(main)
+        with p1, p2:
+            resp = client.get("/api/current/Delhi")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["pollutants"]["pm25"], 75.0)  # from the seeded row
+        self.assertEqual(body["pollutants_source"], "processed_dataset")
+
+    def test_merges_pollutants_from_separate_feed_row(self):
+        now = datetime.now(timezone.utc)
+        self._seed_reading("Delhi", 28.7041, 77.1025, now, 155.0, "waqi")
+        self._seed_reading(
+            "Delhi", 28.7041, 77.1025, now - timedelta(seconds=30), None, "owm_nowcast",
+            pollutants={"co": 0.22, "no2": 7.5, "o3": 89.5, "pm10": 44.1, "pm25": 22.3, "so2": 1.9},
+        )
+        client, main = self._client()
+        p1, p2 = self._stored_only(main)
+        with p1, p2:
+            resp = client.get("/api/current/Delhi")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["aqi"], 155.0)                # newest AQI feed
+        self.assertEqual(body["pollutants"]["pm25"], 22.3)  # newest real concentration
+        self.assertEqual(body["pollutants_source"], "owm_nowcast")
+        self.assertIsNotNone(body["pollutants_as_of"])
+
+    def test_missing_pollutants_report_null_not_fake_number(self):
+        now = datetime.now(timezone.utc)
+        self._seed_reading("Faridabad", 28.4089, 77.3178, now, 180.0, "waqi")
+        client, main = self._client()
+        p1, p2 = self._stored_only(main)
+        with p1, p2:
+            resp = client.get("/api/current/Faridabad")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["aqi"], 180.0)
+        self.assertTrue(all(body["pollutants"][k] is None for k in self._POLL))
+        self.assertIsNone(body["pollutants_source"])
+
+    def test_latest_pollutant_reading_skips_aqi_only_rows(self):
+        now = datetime.now(timezone.utc)
+        self._seed_reading("Delhi", 28.7041, 77.1025, now, 155.0, "waqi")
+        got = service.query_latest_pollutant_reading("Delhi")
+        # newest genuine concentration is the seeded processed_dataset row
+        self.assertIsNotNone(got)
+        self.assertEqual(got["source"], "processed_dataset")
+        self.assertEqual(got["pm25"], 75.0)

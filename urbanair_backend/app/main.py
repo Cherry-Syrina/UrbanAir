@@ -241,14 +241,30 @@ def _load_latest_ground_aqi(city: str):
     return city_rows.sort_values("timestamp").iloc[-1]
 
 
-def _current_from_stored(city: str, stored: dict) -> dict:
+_POLLUTANT_KEYS = ("co", "no2", "o3", "pm10", "pm25", "so2")
+
+
+def _current_from_stored(city: str, stored: dict,
+                         pollutant_reading: Optional[dict] = None) -> dict:
     """Build a /api/current-style payload from a STORED observation.
 
     Clearly marked `data_origin="stored_observation"` and `is_estimated=True`
     so a historical row from the 2019-2024 dataset is never presented as a
-    live measurement."""
+    live measurement.
+
+    The newest row is frequently an AQI-only feed (WAQI ground AQI) with null
+    pollutant columns, while the genuine concentrations live in a separate,
+    near-simultaneous row (OWM nowcast). ``pollutant_reading`` is that row, if
+    any: concentrations are taken from the AQI row when present, else from it,
+    and each value remains a real measurement (never interpolated/fabricated).
+    ``pollutants_as_of``/``pollutants_source`` say exactly where they came
+    from, so the frontend can label them honestly or show "Data unavailable"."""
     aqi_val = stored.get("aqi")
     category = stored.get("category") or aqi_category_from_value(aqi_val) if aqi_val is not None else None
+
+    has_in_stored = any(stored.get(k) is not None for k in _POLLUTANT_KEYS)
+    source = stored if has_in_stored else (pollutant_reading or {})
+
     return {
         "city": city,
         "arbitration": None,
@@ -259,10 +275,9 @@ def _current_from_stored(city: str, stored: dict) -> dict:
         "aqi": round(float(aqi_val), 1) if aqi_val is not None else None,
         "category": category,
         "color": AQI_CATEGORY_COLORS.get(category, "#888888"),
-        "pollutants": {
-            "co": stored.get("co"), "no2": stored.get("no2"), "o3": stored.get("o3"),
-            "pm10": stored.get("pm10"), "pm25": stored.get("pm25"), "so2": stored.get("so2"),
-        },
+        "pollutants": {k: source.get(k) for k in _POLLUTANT_KEYS},
+        "pollutants_as_of": source.get("timestamp"),
+        "pollutants_source": source.get("source"),
     }
 
 
@@ -302,7 +317,11 @@ def get_current(city: str):
         # observation from Supabase (clearly marked as such) before giving up.
         stored = db_service.query_latest_reading(city)
         if stored and stored.get("aqi") is not None:
-            return _current_from_stored(city, stored)
+            # The newest row is often an AQI-only feed (WAQI); the genuine
+            # concentrations usually sit in a separate near-simultaneous row
+            # (OWM nowcast). Merge the two honestly -- see _current_from_stored.
+            pollutant_reading = db_service.query_latest_pollutant_reading(city)
+            return _current_from_stored(city, stored, pollutant_reading)
         raise HTTPException(
             503,
             f"No live data available yet for {city} and no stored reading in "
@@ -438,6 +457,26 @@ def _forecast_from_stored(city: str, stored: list) -> dict:
     }
 
 
+def _with_current_aqi(payload: dict, city: str) -> dict:
+    """Fill a forecast payload's ``current_aqi`` from the same source
+    ``/api/current`` uses, when the forecast itself has none.
+
+    Stored-forecast payloads (``_forecast_from_stored``) have no live history,
+    so their ``current_aqi`` is None even though ``/api/current`` returns a real
+    reading (live measurement, or the stored-observation fallback). Copy that in
+    rather than shipping null. If ``/api/current`` has nothing either, the field
+    stays None -- it is never fabricated."""
+    if payload.get("current_aqi") is not None:
+        return payload
+    try:
+        current = get_current(city)
+        payload["current_aqi"] = current.get("aqi")
+        payload["current_aqi_origin"] = current.get("data_origin")
+    except HTTPException:
+        pass
+    return payload
+
+
 @app.get("/api/forecast/{city}")
 def forecast(city: str, reference_time: Optional[str] = None, persist: bool = True):
     """24/48/72hr forecast, built from the LIVE accumulating history
@@ -463,7 +502,7 @@ def forecast(city: str, reference_time: Optional[str] = None, persist: bool = Tr
         # forecast rows from Supabase instead of failing, clearly marked.
         stored = db_service.query_latest_forecasts(city)
         if stored:
-            return _forecast_from_stored(city, stored)
+            return _with_current_aqi(_forecast_from_stored(city, stored), city)
         raise HTTPException(
             503,
             f"No live history yet for {city} and no stored forecast in the "
@@ -477,7 +516,7 @@ def forecast(city: str, reference_time: Optional[str] = None, persist: bool = Tr
     # and duplicate-safe via the forecast unique constraint).
     if persist:
         db_service.persist_forecast(city, payload)
-    return payload
+    return _with_current_aqi(payload, city)
 
 
 @app.get("/api/historical/{city}")

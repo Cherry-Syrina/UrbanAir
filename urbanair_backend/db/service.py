@@ -314,6 +314,21 @@ def query_latest_reading(city: str) -> Optional[dict]:
         return None
 
 
+def query_latest_pollutant_reading(city: str) -> Optional[dict]:
+    """Most recent stored observation for a city that has any genuine pollutant
+    concentration -- which can differ from the latest AQI-only reading.
+    Returns None when the database is unavailable or no such row exists."""
+    if not database.is_configured():
+        return None
+    _ensure_schema()
+    try:
+        with session_scope() as session:
+            return repository.get_latest_pollutant_reading(session, city)
+    except Exception as exc:
+        logger.warning("query_latest_pollutant_reading failed for %s: %s", city, str(exc)[:160])
+        return None
+
+
 def query_recent_readings(city: str, limit: int = 168) -> Optional[list]:
     """Latest stored observations for a city (no time window), or None."""
     if not database.is_configured():

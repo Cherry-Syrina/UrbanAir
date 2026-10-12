@@ -34,6 +34,21 @@ const ALL_POINTS = [
   "Vivek Vihar", "Wazirpur", "Chandni Chowk", "Red Fort", "Connaught Place",
 ];
 
+// Canonical pollutant readout. `key` maps to the backend `pollutants` object.
+// A card shows a number ONLY when the backend returns a genuine measurement;
+// otherwise it shows an explicit "Data unavailable" state -- never a blank
+// dash that could be mistaken for a zero. No backend source reports NOx
+// (feeds give NO and NO2 separately), so that card is unavailable by design.
+const POLLUTANTS = [
+  { key: "pm25", label: "PM2.5", unit: "µg/m³" },
+  { key: "pm10", label: "PM10", unit: "µg/m³" },
+  { key: "no2", label: "NO2", unit: "µg/m³" },
+  { key: "nox", label: "NOx", unit: "µg/m³" },
+  { key: "co", label: "CO", unit: "mg/m³" },
+  { key: "so2", label: "SO2", unit: "µg/m³" },
+  { key: "o3", label: "O3", unit: "µg/m³" },
+];
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("overview");
   const [cities, setCities] = useState([]);
@@ -265,16 +280,41 @@ export default function App() {
               )}
             </div>
 
-            {currentReading?.pollutants && (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
-                {Object.entries(currentReading.pollutants).map(([key, val]) => (
-                  <div key={key} style={{ textAlign: "center", background: "var(--bg-panel-raised)", borderRadius: "var(--radius-sm)", padding: "8px 4px" }}>
-                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 14, color: "var(--text-primary)" }}>
-                      {val != null ? val.toFixed(1) : "—"}
-                    </div>
-                    <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", marginTop: 2 }}>{key}</div>
+            {currentReading && (
+              <div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                  {POLLUTANTS.map((p) => {
+                    const val = currentReading.pollutants?.[p.key];
+                    const hasValue = typeof val === "number" && Number.isFinite(val);
+                    return (
+                      <div
+                        key={p.key}
+                        title={
+                          hasValue
+                            ? `${p.label} (${p.unit})${currentReading.pollutants_source ? ` · ${currentReading.pollutants_source}` : ""}`
+                            : `${p.label} is not reported by the current data source`
+                        }
+                        style={{ textAlign: "center", background: "var(--bg-panel-raised)", borderRadius: "var(--radius-sm)", padding: "8px 4px" }}
+                      >
+                        {hasValue ? (
+                          <div style={{ fontFamily: "var(--font-mono)", fontSize: 14, color: "var(--text-primary)" }}>
+                            {val.toFixed(1)}
+                          </div>
+                        ) : (
+                          <div style={{ fontFamily: "var(--font-mono)", fontSize: 9.5, color: "var(--text-tertiary)", lineHeight: "17px" }}>
+                            Data unavailable
+                          </div>
+                        )}
+                        <div style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", marginTop: 2 }}>{p.label}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {currentReading.pollutants_source && (
+                  <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 9, color: "var(--text-tertiary)", textAlign: "right" }}>
+                    {currentReading.is_estimated ? "estimated" : "measured"} · {currentReading.pollutants_source}
                   </div>
-                ))}
+                )}
               </div>
             )}
 

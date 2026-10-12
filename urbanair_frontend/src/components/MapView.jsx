@@ -4,6 +4,21 @@ import { severityFor } from "./AqiGauge";
 import { api } from "../api";
 import SearchBar from "./SearchBar";
 
+// Basemap tiles. CARTO's free raster CDN (`basemaps.cartocdn.com`) began
+// requiring an API key on 2026-09-25 and now serves an "API KEY REQUIRED"
+// placeholder tile without one -- which is the watermark users saw. Esri's
+// World Dark Gray Canvas is served from a public, key-free endpoint and keeps
+// the dark theme. A keyed/custom provider can still be supplied via
+// VITE_MAP_TILE_URL (e.g. CARTO + key) without code changes.
+const DEFAULT_TILE_URL =
+  "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}";
+const DEFAULT_LABEL_URL =
+  "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}";
+const TILE_URL = import.meta.env.VITE_MAP_TILE_URL || DEFAULT_TILE_URL;
+// Only stack the label reference layer on the default provider; a custom base
+// (e.g. CARTO Dark) already ships its own labels.
+const LABEL_URL = TILE_URL === DEFAULT_TILE_URL ? DEFAULT_LABEL_URL : null;
+
 const LAYER_OPTIONS = [
   { key: "parks", label: "Parks", color: "#2DD9C0" },
   { key: "industrial", label: "Industrial zones", color: "#D9534F" },
@@ -88,10 +103,8 @@ export default function MapView({ cityReadings, selectedCity, onSelectCity }) {
         style={{ height: "100%", width: "100%", background: "var(--bg-base)" }}
         zoomControl={true}
       >
-        <TileLayer
-          url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-          attribution='&copy; OpenStreetMap &copy; CARTO'
-        />
+        <TileLayer url={TILE_URL} attribution="Tiles &copy; Esri" />
+        {LABEL_URL && <TileLayer url={LABEL_URL} />}
 
         <ClickHandler onMapClick={(lat, lon) => probeLocation(lat, lon, null)} />
         <FlyToLocation target={flyTarget} />
