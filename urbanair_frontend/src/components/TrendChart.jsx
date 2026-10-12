@@ -29,9 +29,38 @@ function CustomTooltip({ active, payload, label }) {
 }
 
 export default function TrendChart({ data }) {
-  if (!data || data.length === 0) return null;
+  const points = data || [];
+  const hoursSpan = points.length;
 
-  const hoursSpan = data.length; // hourly-resolution live series
+  // Not enough recent observations to draw a meaningful trend. Show an honest
+  // warm-up state instead of plotting stale rows from years ago.
+  if (hoursSpan < 2) {
+    return (
+      <div>
+        <h3 style={{ fontFamily: "var(--font-display)", fontSize: 15, margin: "0 0 12px 0" }}>
+          7-day trend
+        </h3>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            height: 180,
+            border: "1px dashed var(--border-subtle)",
+            borderRadius: "var(--radius-sm)",
+            color: "var(--text-tertiary)",
+            fontFamily: "var(--font-mono)",
+            fontSize: 12,
+            textAlign: "center",
+            padding: "0 16px",
+          }}
+        >
+          Collecting live history: {hoursSpan}h / 168h needed.
+        </div>
+      </div>
+    );
+  }
+
   const title = hoursSpan >= 168 ? "7-day trend" : `Trend (${hoursSpan}h of live data collected so far)`;
 
   return (
@@ -40,7 +69,7 @@ export default function TrendChart({ data }) {
         {title}
       </h3>
       <ResponsiveContainer width="100%" height={180}>
-        <AreaChart data={data} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
+        <AreaChart data={points} margin={{ top: 5, right: 10, left: -10, bottom: 0 }}>
           <defs>
             <linearGradient id="aqiGradient" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="var(--accent)" stopOpacity={0.35} />
@@ -56,7 +85,7 @@ export default function TrendChart({ data }) {
             fontFamily="var(--font-mono)"
             tickLine={false}
             axisLine={{ stroke: "var(--border-subtle)" }}
-            interval={Math.floor(data.length / 6)}
+            interval={Math.max(0, Math.floor(points.length / 6))}
           />
           <YAxis
             stroke="var(--text-tertiary)"
@@ -78,6 +107,18 @@ export default function TrendChart({ data }) {
           />
         </AreaChart>
       </ResponsiveContainer>
+      {hoursSpan < 168 && (
+        <div
+          style={{
+            marginTop: 8,
+            color: "var(--text-tertiary)",
+            fontFamily: "var(--font-mono)",
+            fontSize: 10,
+          }}
+        >
+          Collecting live history: {hoursSpan}h / 168h needed.
+        </div>
+      )}
     </div>
   );
 }

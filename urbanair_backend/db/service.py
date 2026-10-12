@@ -329,14 +329,17 @@ def query_latest_pollutant_reading(city: str) -> Optional[dict]:
         return None
 
 
-def query_recent_readings(city: str, limit: int = 168) -> Optional[list]:
-    """Latest stored observations for a city (no time window), or None."""
+def query_recent_readings(city: str, limit: int = 168, since=None) -> Optional[list]:
+    """Latest stored observations for a city, or None.
+
+    `since` (a timezone-aware datetime) bounds the result to a real time
+    window instead of a row count, so stale historical rows are excluded."""
     if not database.is_configured():
         return None
     _ensure_schema()
     try:
         with session_scope() as session:
-            return repository.get_recent_readings(session, city, limit)
+            return repository.get_recent_readings(session, city, limit, since=since)
     except Exception as exc:
         logger.warning("query_recent_readings failed for %s: %s", city, str(exc)[:160])
         return None

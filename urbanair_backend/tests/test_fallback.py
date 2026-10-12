@@ -51,7 +51,7 @@ class FallbackTestCase(TestCase):
         sid = repository.ensure_station(session, "Delhi", 28.7041, 77.1025)
         repository.save_aqi_readings(session, [
             {"station_id": sid,
-             "observed_at": datetime(2024, 1, 1, h, 0, tzinfo=timezone.utc),
+             "observed_at": datetime.now(timezone.utc) - timedelta(hours=(3 - h)),
              "aqi": 200.0 + h, "aqi_category": "Poor",
              "co": 0.5, "no2": 24.0, "o3": 18.0,
              "pm10": 108.0, "pm25": 75.0, "so2": 4.0,
@@ -544,3 +544,76 @@ class TestPollutantCards(FallbackTestCase):
         self.assertIsNotNone(got)
         self.assertEqual(got["source"], "processed_dataset")
         self.assertEqual(got["pm25"], 75.0)
+
+
+class TestHistoricalRecencyWindow(FallbackTestCase):
+    """The trend endpoint used a ROW COUNT (limit=hours), so the last 168 rows
+    could span years: a 2020 imported dataset plus a couple of 2026 live rows,
+    which plotted as 'July 30 - Aug 5' while viewing Oct 2026. It must now be a
+    real time window and must never chart AQI-null rows."""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from app import main
+        return TestClient(main.app), main
+
+    def _seed_reading(self, city, lat, lon, observed_at, aqi, source,
+                      category="Poor", pollutants=None):
+        session = database.get_session()
+        sid = repository.ensure_station(session, city, lat, lon)
+        row = {"station_id": sid, "observed_at": observed_at,
+               "aqi": aqi, "aqi_category": category if aqi is not None else None,
+               "source": source}
+        for k in ("co", "no2", "o3", "pm10", "pm25", "so2"):
+            row[k] = (pollutants or {}).get(k)
+        repository.save_aqi_readings(session, [row])
+        session.commit()
+        session.close()
+
+    def test_old_dataset_rows_outside_window_are_excluded(self):
+        old = datetime.now(timezone.utc) - timedelta(days=365 * 6)
+        self._seed_reading("Delhi", 28.7041, 77.1025, old, 999.0,
+                           "processed_dataset", category="Severe")
+        client, main = self._client()
+        with patch.object(main.live_history, "get_live_history",
+                          return_value=_empty_live()):
+            resp = client.get("/api/historical/Delhi?hours=24")
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.json()
+        self.assertEqual(len(rows), 3)  # only the 3 recent seed rows
+        self.assertTrue(all(r["aqi"] < 999.0 for r in rows))
+
+    def test_no_recent_rows_returns_empty_not_stale(self):
+        session = database.get_session()
+        sid = repository.ensure_station(session, "Faridabad", 28.4089, 77.3178)
+        repository.save_aqi_readings(session, [{
+            "station_id": sid,
+            "observed_at": datetime.now(timezone.utc) - timedelta(days=365 * 6),
+            "aqi": 300.0, "aqi_category": "Very Poor", "source": "processed_dataset",
+        }])
+        session.commit()
+        session.close()
+        client, main = self._client()
+        with patch.object(main.live_history, "get_live_history",
+                          return_value=_empty_live()):
+            resp = client.get("/api/historical/Faridabad?hours=24")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), [])
+
+    def test_aqi_null_rows_are_not_charted(self):
+        session = database.get_session()
+        sid = repository.ensure_station(session, "Delhi", 28.7041, 77.1025)
+        repository.save_aqi_readings(session, [{
+            "station_id": sid, "observed_at": datetime.now(timezone.utc),
+            "aqi": None, "aqi_category": None, "pm25": 22.0, "source": "owm_nowcast",
+        }])
+        session.commit()
+        session.close()
+        client, main = self._client()
+        with patch.object(main.live_history, "get_live_history",
+                          return_value=_empty_live()):
+            resp = client.get("/api/historical/Delhi?hours=24")
+        self.assertEqual(resp.status_code, 200)
+        rows = resp.json()
+        self.assertTrue(rows)
+        self.assertTrue(all(r["aqi"] is not None for r in rows))

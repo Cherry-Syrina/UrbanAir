@@ -25,7 +25,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import joblib
@@ -521,31 +521,34 @@ def forecast(city: str, reference_time: Optional[str] = None, persist: bool = Tr
 
 @app.get("/api/historical/{city}")
 def historical(city: str, hours: int = 168):
-    """Trend-chart series, built from the LIVE accumulating history. Early
-    on this will return fewer points than `hours` asked for -- it grows as
-    the collectors keep running, it doesn't backfill from static data."""
+    """Trend-chart series for the last `hours` hours.
+
+    The live path grows as the collectors keep running. When there is no live
+    history in this container we fall back to STORED observations -- but only
+    those inside the requested time window, so a multi-year-old imported
+    dataset is never stitched to the newest live rows as if it were recent."""
     if city not in CITY_COORDS:
         raise HTTPException(404, f"Unknown city: {city}")
 
     live_df = live_history.get_live_history()
     city_df = live_df[live_df["location_name"] == city].tail(hours)
     if city_df.empty:
-        # Serve stored historical observations (e.g. the 2019-2024 dataset)
-        # so the trend chart still has data without a live collector nearby.
-        stored = db_service.query_recent_readings(city, limit=hours)
-        if stored:
-            return [
-                {
-                    "timestamp": s["timestamp"],
-                    "aqi": round(float(s["aqi"]), 1) if s.get("aqi") is not None else None,
-                    "category": s["category"],
-                    "pm25": s["pm25"],
-                    "pm10": s["pm10"],
-                    "data_origin": "stored_observation",
-                }
-                for s in reversed(stored)
-            ]
-        return []
+        # Serve stored observations from the requested window only (empty when
+        # nothing recent is stored -- the UI shows a warm-up state, not stale data).
+        since = datetime.now(timezone.utc) - timedelta(hours=max(1, int(hours)))
+        stored = db_service.query_recent_readings(city, limit=hours, since=since)
+        return [
+            {
+                "timestamp": s["timestamp"],
+                "aqi": round(float(s["aqi"]), 1) if s.get("aqi") is not None else None,
+                "category": s["category"],
+                "pm25": s["pm25"],
+                "pm10": s["pm10"],
+                "data_origin": "stored_observation",
+            }
+            for s in reversed(stored or [])
+            if s.get("aqi") is not None  # a trend of AQI can't chart null-AQI rows
+        ]
     return [
         {
             "timestamp": row["timestamp"].isoformat(),

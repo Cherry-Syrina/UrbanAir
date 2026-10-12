@@ -295,18 +295,21 @@ def get_latest_pollutant_reading(session, station_name: str) -> Optional[dict]:
     return _aqi_to_dict(row) if row is not None else None
 
 
-def get_recent_readings(session, station_name: str, limit: int) -> list:
+def get_recent_readings(session, station_name: str, limit: int, since=None) -> list:
     """Latest `limit` stored observations for a station, newest first.
 
-    No lower time bound (unlike get_aqi_history) so the historical 2019-2024
-    dataset is still reachable once the live window has moved past it."""
+    When `since` is given, only observations at/after that time are returned.
+    The trend endpoint uses this so a multi-year-old imported dataset is never
+    stitched together with the newest live rows (which made the chart show
+    dates from years ago)."""
     stmt = (
         select(models.AqiReading)
         .join(models.Station, models.AqiReading.station_id == models.Station.id)
         .where(models.Station.name == station_name)
-        .order_by(models.AqiReading.observed_at.desc())
-        .limit(max(1, int(limit)))
     )
+    if since is not None:
+        stmt = stmt.where(models.AqiReading.observed_at >= since)
+    stmt = stmt.order_by(models.AqiReading.observed_at.desc()).limit(max(1, int(limit)))
     return [_aqi_to_dict(r) for r in session.execute(stmt).scalars().all()]
 
 
