@@ -632,19 +632,45 @@ def enforcement_intelligence():
         # Use nearest known city for AQI forecast (hotspots reuse their nearest city's AQI series)
         point_lat, point_lon = sa.CITY_COORDS[point]
         city_for_aqi, _ = sa.nearest_known_city(point_lat, point_lon)
+
+        # Current AQI: reuse the SAME source the /api/current and
+        # /api/health-advisory endpoints use (live measurement, or the stored
+        # observation fallback). Previously this read `fc["current_aqi"]`,
+        # which is None for stored forecasts -- so every deployed point showed
+        # a null current AQI even though /api/current had a real value.
+        current_aqi = None
+        try:
+            current_aqi = get_current(city_for_aqi).get("aqi")
+        except HTTPException:
+            current_aqi = None
+
+        # +24h forecast: reuse the forecast payload (live history, or the
+        # stored/persisted fallback). `data_maturity` is None for stored
+        # forecasts, so we read the 24h value structurally and let
+        # `_forecast_status` report warming-up honestly -- the old code did
+        # `fc["data_maturity"]["is_warming_up"]`, which raised for stored
+        # forecasts and wiped BOTH aqi_24h and current_aqi to None.
+        aqi_24h = None
+        forecast_is_warming_up = None
         try:
             fc = forecast(city_for_aqi, persist=False)
-            forecast_24h = next(f for f in fc["forecasts"] if f["horizon_hours"] == 24)
-            aqi_24h = forecast_24h["predicted_aqi"]
-            current_aqi = fc["current_aqi"]
-            forecast_is_warming_up = fc["data_maturity"]["is_warming_up"]
-        except Exception:
-            aqi_24h = None
-            current_aqi = None
-            forecast_is_warming_up = None
+        except HTTPException:
+            fc = None
+        if fc:
+            aqi_24h = next(
+                (f["predicted_aqi"] for f in fc["forecasts"]
+                 if f["horizon_hours"] == 24),
+                None,
+            )
+            forecast_is_warming_up = _forecast_status(fc)["forecast_is_warming_up"]
+            if current_aqi is None:
+                current_aqi = fc.get("current_aqi")
 
         candidate_aqis = [v for v in (current_aqi, aqi_24h) if v is not None]
-        aqi_for_ranking = max(candidate_aqis) if candidate_aqis else 150
+        # Rank on the WORSE of "now" and "+24h". If neither is available we
+        # keep the point but leave the AQI null and rank it last -- the old
+        # code defaulted to 150, which looked like a real (moderate) reading.
+        aqi_for_ranking = max(candidate_aqis) if candidate_aqis else None
 
         sources = attr["sources"]
         dominant_source = max(
@@ -653,8 +679,10 @@ def enforcement_intelligence():
         )
         congestion_ratio = attr["raw_signals"]["congestion_ratio"]
 
-        # Priority score: weighted combination, higher = more urgent
-        severity_component = aqi_for_ranking / 500.0  # normalize against CPCB practical max
+        # Priority score: weighted combination, higher = more urgent.
+        # AQI severity is only part of the score, so a missing AQI contributes
+        # 0 here (and the point is still ranked last by aqi_for_ranking=None).
+        severity_component = (aqi_for_ranking or 0.0) / 500.0  # normalize against CPCB practical max
         congestion_component = max(0.0, 1.0 - congestion_ratio)
         source_intensity = max(v for k, v in sources.items() if k != "background_pct") / 100.0
 
@@ -673,6 +701,8 @@ def enforcement_intelligence():
             reasons.append(f"AQI currently at {round(current_aqi)} ({aqi_category_from_value(current_aqi)})")
         if aqi_24h and aqi_24h > 200:
             reasons.append(f"AQI forecast to reach {round(aqi_24h)} (Poor+) within 24h")
+        if aqi_for_ranking is None:
+            reasons.append("No current or forecasted AQI available for this point")
         if not reasons:
             reasons.append("No acute signal -- routine monitoring sufficient")
 
@@ -691,7 +721,7 @@ def enforcement_intelligence():
         priorities.append({
             "point": point,
             "priority_score": priority_score,
-            "aqi_for_ranking": round(aqi_for_ranking, 1),
+            "aqi_for_ranking": round(aqi_for_ranking, 1) if aqi_for_ranking is not None else None,
             "current_aqi": round(current_aqi, 1) if current_aqi is not None else None,
             "forecast_aqi_24h": round(aqi_24h, 1) if aqi_24h is not None else None,
             "forecast_is_warming_up": forecast_is_warming_up,
@@ -706,7 +736,13 @@ def enforcement_intelligence():
     # at the same AQI level, so a very congested/industrial area can still
     # be ranked above an otherwise-identical AQI area, but never above a
     # genuinely worse-AQI area.
-    priorities.sort(key=lambda x: (x["aqi_for_ranking"], x["priority_score"]), reverse=True)
+    # Points with no AQI at all sort below any real reading (use -1 sentinel;
+    # do not coerce None to 0 -- 0 is a valid "Good" AQI).
+    priorities.sort(
+        key=lambda x: (x["aqi_for_ranking"] if x["aqi_for_ranking"] is not None else -1,
+                       x["priority_score"]),
+        reverse=True,
+    )
     for i, p in enumerate(priorities):
         p["rank"] = i + 1
 

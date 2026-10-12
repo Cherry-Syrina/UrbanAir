@@ -8,7 +8,7 @@ prove the *fallback* wiring without touching Supabase or real data.
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
@@ -283,3 +283,154 @@ class TestEndpointFallback(FallbackTestCase):
         self.assertEqual(rows[0]["data_origin"], "stored_alert")
         self.assertEqual(rows[0]["point"], "Delhi")
         self.assertEqual(rows[0]["rank"], 1)
+
+
+class TestEnforcementRanking(FallbackTestCase):
+    """Regression tests for /api/enforcement showing null AQI + hardcoded 150.
+
+    Root cause: the endpoint read `current_aqi` from `fc["current_aqi"]` (None
+    for stored forecasts) and did `fc["data_maturity"]["is_warming_up"]`, which
+    raised for stored forecasts and wiped BOTH values to None; the ranking then
+    fell back to the constant 150."""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from app import main
+        return TestClient(main.app), main
+
+    @staticmethod
+    def _attr(point):
+        return {
+            "point": point,
+            "sources": {"traffic_pct": 40.0, "industrial_pct": 20.0,
+                        "construction_pct": 5.0, "waste_burning_pct": 5.0,
+                        "background_pct": 30.0},
+            "raw_signals": {"congestion_ratio": 0.5, "wind_speed_mps": 1.0,
+                            "wind_deg": 0, "is_stubble_burning_season": False},
+        }
+
+    def test_uses_real_current_aqi_and_forecast(self):
+        client, main = self._client()
+        # Stored forecast: current_aqi None and data_maturity None (the state
+        # that used to crash the row). Current AQI must come from get_current.
+        fc = {"forecasts": [{"horizon_hours": 24, "predicted_aqi": 260.0}],
+              "current_aqi": None, "data_maturity": None,
+              "data_origin": "database_stored_forecast"}
+        with patch.object(main, "source_attribution_all", return_value=[self._attr("Delhi")]), \
+                patch.object(main, "get_current", return_value={"aqi": 152.0, "category": "Moderate"}), \
+                patch.object(main, "forecast", return_value=fc), \
+                patch.object(main.db_service, "persist_enforcement", return_value=0):
+            resp = client.get("/api/enforcement")
+        self.assertEqual(resp.status_code, 200)
+        row = resp.json()[0]
+        self.assertEqual(row["current_aqi"], 152.0)
+        self.assertEqual(row["forecast_aqi_24h"], 260.0)
+        self.assertEqual(row["aqi_for_ranking"], 260.0)  # worse of now / +24h
+        self.assertIsNone(row["forecast_is_warming_up"])
+        self.assertNotEqual(row["aqi_for_ranking"], 150)
+
+    def test_live_forecast_reports_warming_up(self):
+        client, main = self._client()
+        fc = {"forecasts": [{"horizon_hours": 24, "predicted_aqi": 90.0}],
+              "current_aqi": 120.0,
+              "data_maturity": {"hours_available": 5, "is_warming_up": True}}
+        with patch.object(main, "source_attribution_all", return_value=[self._attr("Delhi")]), \
+                patch.object(main, "get_current", return_value={"aqi": 120.0, "category": "Moderate"}), \
+                patch.object(main, "forecast", return_value=fc), \
+                patch.object(main.db_service, "persist_enforcement", return_value=0):
+            resp = client.get("/api/enforcement")
+        row = resp.json()[0]
+        self.assertTrue(row["forecast_is_warming_up"])
+        self.assertEqual(row["current_aqi"], 120.0)
+        self.assertEqual(row["forecast_aqi_24h"], 90.0)
+        self.assertEqual(row["aqi_for_ranking"], 120.0)  # now worse than +24h
+
+    def test_missing_data_is_null_not_hardcoded_150(self):
+        from fastapi import HTTPException
+
+        client, main = self._client()
+        with patch.object(main, "source_attribution_all", return_value=[self._attr("Delhi")]), \
+                patch.object(main, "get_current",
+                             side_effect=HTTPException(503, "no reading")), \
+                patch.object(main, "forecast",
+                             side_effect=HTTPException(503, "no forecast")), \
+                patch.object(main.db_service, "persist_enforcement", return_value=0):
+            resp = client.get("/api/enforcement")
+        self.assertEqual(resp.status_code, 200)
+        row = resp.json()[0]
+        self.assertIsNone(row["current_aqi"])
+        self.assertIsNone(row["forecast_aqi_24h"])
+        self.assertIsNone(row["aqi_for_ranking"])
+        self.assertTrue(any("No current or forecasted AQI" in r for r in row["reasons"]))
+
+    def test_ranking_orders_by_real_aqi(self):
+        def _cur(city):
+            return {"Delhi": 105.0, "Faridabad": 180.0}[city]
+
+        from fastapi import HTTPException
+
+        client, main = self._client()
+        with patch.object(main, "source_attribution_all",
+                          return_value=[self._attr("Delhi"), self._attr("Faridabad")]), \
+                patch.object(main, "get_current",
+                             side_effect=lambda city: {"aqi": _cur(city), "category": "Moderate"}), \
+                patch.object(main, "forecast",
+                             side_effect=HTTPException(503, "no forecast")), \
+                patch.object(main.db_service, "persist_enforcement", return_value=0):
+            resp = client.get("/api/enforcement")
+        rows = resp.json()
+        self.assertEqual([r["point"] for r in rows], ["Faridabad", "Delhi"])
+        self.assertEqual([r["rank"] for r in rows], [1, 2])
+        self.assertEqual(rows[0]["aqi_for_ranking"], 180.0)
+        self.assertEqual(rows[1]["aqi_for_ranking"], 105.0)
+
+
+class TestForecastGrouping(FallbackTestCase):
+    """Multiple runs accumulate in aqi_forecasts (one generated_at per run);
+    the API must present the LATEST value per horizon, not every run."""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from app import main
+        return TestClient(main.app), main
+
+    def _persist_second_run(self):
+        # setUp already persisted one run (24h=210, 48h=230). Add a later run.
+        service.persist_forecast("Delhi", {
+            "city": "Delhi",
+            "reference_time": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            "forecasts": [
+                {"horizon_hours": 24, "predicted_aqi": 300.0, "predicted_category": "Poor"},
+                {"horizon_hours": 48, "predicted_aqi": 320.0, "predicted_category": "Very Poor"},
+            ],
+        })
+
+    def test_latest_per_horizon_is_returned(self):
+        self._persist_second_run()
+        rows = service.query_latest_forecasts("Delhi")
+        self.assertEqual([r["horizon_hours"] for r in rows], [24, 48])
+        self.assertEqual([r["predicted_aqi"] for r in rows], [300.0, 320.0])
+
+    def test_all_runs_are_preserved_in_the_table(self):
+        from sqlalchemy import func, select
+        from db import models
+
+        self._persist_second_run()
+        session = database.get_session()
+        try:
+            total = session.execute(
+                select(func.count()).select_from(models.AqiForecast)
+            ).scalar_one()
+        finally:
+            session.close()
+        self.assertEqual(total, 4)  # both runs kept; only the read collapses
+
+    def test_forecast_endpoint_groups_by_horizon(self):
+        self._persist_second_run()
+        client, main = self._client()
+        with patch.object(main.live_history, "get_live_history",
+                          return_value=_empty_live()):
+            resp = client.get("/api/forecast/Delhi")
+        self.assertEqual(resp.status_code, 200)
+        horizons = [f["horizon_hours"] for f in resp.json()["forecasts"]]
+        self.assertEqual(horizons, [24, 48])

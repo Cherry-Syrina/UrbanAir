@@ -212,15 +212,28 @@ def count_aqi_history(session, station_name: str, hours: int) -> int:
 
 
 def get_latest_forecasts(session, station_name: str) -> list:
+    """Most recent persisted forecast batch for a station, ONE row per horizon.
+
+    Every collection run inserts a full set of horizons with its own
+    ``generated_at`` (the unique constraint is station+target_at+horizon+model,
+    and target_at shifts with each run's reference time). Multiple runs
+    therefore accumulate legitimately -- they are separate model outputs, not
+    duplicates. "Latest forecast" means the newest ``generated_at`` row per
+    horizon, so historical runs stay in the table but don't appear as
+    repeated 24h/48h/72h entries in API responses.
+    """
     stmt = (
         select(models.AqiForecast)
         .join(models.Station, models.AqiForecast.station_id == models.Station.id)
         .where(models.Station.name == station_name)
-        .order_by(models.AqiForecast.generated_at.desc(),
-                  models.AqiForecast.horizon_hours.asc())
-        .limit(12)
+        .order_by(models.AqiForecast.generated_at.desc())
     )
-    return [_forecast_to_dict(r) for r in session.execute(stmt).scalars().all()]
+    latest_per_horizon = {}
+    for row in session.execute(stmt).scalars().all():
+        if row.horizon_hours not in latest_per_horizon:
+            latest_per_horizon[row.horizon_hours] = row
+    rows = sorted(latest_per_horizon.values(), key=lambda r: r.horizon_hours)
+    return [_forecast_to_dict(r) for r in rows]
 
 
 def get_alerts(session, status: Optional[str], limit: int, offset: int) -> list:
