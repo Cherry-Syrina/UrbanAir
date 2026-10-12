@@ -745,18 +745,55 @@ HEALTH_ADVISORY_TABLE = {
 }
 
 
+def _forecast_status(fc) -> dict:
+    """Honest forecast-status flags for the advisory payload.
+
+    ``data_maturity`` is ``None`` when the forecast was served from STORED rows
+    (`_forecast_from_stored`) -- i.e. this container has no live collector CSVs.
+    We report that explicitly instead of inventing a maturity value or crashing.
+    ``fc`` may also be ``None`` when there is no forecast at all (live history
+    absent AND nothing persisted): we say so rather than fabricate one.
+
+    Returns ``forecast_is_warming_up`` (kept for backward compatibility; None
+    when unknown), ``forecast_status`` and ``forecast_data_origin``.
+    """
+    if not fc:
+        return {
+            "forecast_is_warming_up": None,
+            "forecast_status": "unavailable",
+            "forecast_data_origin": None,
+        }
+    maturity = fc.get("data_maturity")
+    if maturity is None:
+        return {
+            "forecast_is_warming_up": None,
+            "forecast_status": "stored",
+            "forecast_data_origin": fc.get("data_origin"),
+        }
+    warming = maturity.get("is_warming_up")
+    return {
+        "forecast_is_warming_up": warming,
+        "forecast_status": "warming_up" if warming else "live",
+        "forecast_data_origin": fc.get("data_origin") or "live_measurement",
+    }
+
+
 def _build_health_advisory_payload(current, fc):
     """Shared by the single-city and all-points endpoints so both stay
-    in sync with one source of truth for the advisory text logic."""
+    in sync with one source of truth for the advisory text logic.
+
+    ``fc`` may be ``None`` (forecast unavailable) or a stored-forecast payload
+    whose ``data_maturity`` is ``None``; both are handled without inventing a
+    forecast -- the status fields say exactly what happened."""
     category = current["category"]
     advisory = HEALTH_ADVISORY_TABLE.get(category, HEALTH_ADVISORY_TABLE["Moderate"])
 
     horizon_advisories = []
-    for f in fc["forecasts"]:
-        cat = f["predicted_category"]
+    for f in (fc or {}).get("forecasts") or []:
+        cat = f.get("predicted_category")
         horizon_advisories.append({
-            "horizon_hours": f["horizon_hours"],
-            "predicted_aqi": f["predicted_aqi"],
+            "horizon_hours": f.get("horizon_hours"),
+            "predicted_aqi": f.get("predicted_aqi"),
             "category": cat,
             "advisory": HEALTH_ADVISORY_TABLE.get(cat, HEALTH_ADVISORY_TABLE["Moderate"])["general"],
         })
@@ -767,7 +804,7 @@ def _build_health_advisory_payload(current, fc):
         "general_advisory": advisory["general"],
         "sensitive_groups_advisory": advisory["sensitive"],
         "forecast_advisories": horizon_advisories,
-        "forecast_is_warming_up": fc["data_maturity"]["is_warming_up"],
+        **_forecast_status(fc),
     }
 
 
@@ -777,7 +814,16 @@ def health_advisory(city: str):
         raise HTTPException(404, f"Unknown city: {city}")
 
     current = get_current(city)
-    fc = forecast(city, persist=False)
+    try:
+        fc = forecast(city, persist=False)
+    except HTTPException as exc:
+        # No forecast available at all (live history absent and nothing
+        # persisted). Serve the current-AQI advisory with an explicit
+        # "unavailable" status instead of 500/503 -- the current reading is
+        # still genuinely useful.
+        if exc.status_code != 503:
+            raise
+        fc = None
     return {"city": city, **_build_health_advisory_payload(current, fc)}
 
 
@@ -798,11 +844,16 @@ def health_advisory_all():
         nearest_city, dist_km = sa.nearest_known_city(lat, lon)
         try:
             current = get_current(nearest_city)
+        except HTTPException:
+            # nearest trained city has no current reading at all -- skip this
+            # point rather than serving a stale/fake one
+            continue
+        try:
             fc = forecast(nearest_city, persist=False)
         except HTTPException:
-            # nearest trained city has no live reading yet (still warming
-            # up) -- skip this point rather than serving a stale/fake one
-            continue
+            # forecast unavailable for this point, but the current-AQI advisory
+            # is still useful -- include it with forecast_status="unavailable"
+            fc = None
 
         payload = _build_health_advisory_payload(current, fc)
         results.append({
