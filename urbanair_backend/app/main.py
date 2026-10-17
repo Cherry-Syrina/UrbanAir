@@ -24,6 +24,7 @@ Endpoints:
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -1046,6 +1047,9 @@ def whatif(req: WhatIfRequest):
 # ---------------------------------------------------------------
 # Alerts / Notifications
 # ---------------------------------------------------------------
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 def _get_alert_context(point):
     if point not in sa.CITY_COORDS:
         raise HTTPException(404, f"Unknown point: {point}")
@@ -1095,6 +1099,10 @@ def alert_send_status():
 
 @app.post("/api/alerts/send")
 def send_alert(req: SendAlertRequest):
+    to_email = (req.to_email or "").strip()
+    if not _EMAIL_RE.match(to_email):
+        raise HTTPException(400, "A valid recipient email address is required.")
+
     if req.alert_type == "official":
         content = alert_for_officials(req.point)
         subject = f"UrbanAir AI -- Enforcement Alert: {req.point}"
@@ -1107,7 +1115,7 @@ def send_alert(req: SendAlertRequest):
         raise HTTPException(400, "alert_type must be 'official' or 'public'")
 
     try:
-        result = notifications.send_email(req.to_email, subject, body)
+        result = notifications.send_email(to_email, subject, body)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     except Exception as e:

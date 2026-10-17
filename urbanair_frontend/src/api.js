@@ -12,7 +12,20 @@ async function request(path, options = {}) {
     ...options,
   });
   if (!res.ok) {
-    throw new Error(`API ${path} failed: ${res.status}`);
+    // Prefer the backend's `detail` message (e.g. "SMTP is not configured on
+    // the server") so callers can show it verbatim; fall back to the status.
+    let detail = `API ${path} failed: ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body && body.detail) {
+        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      }
+    } catch {
+      // non-JSON error body — keep the generic message
+    }
+    const err = new Error(detail);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
@@ -43,4 +56,9 @@ export const api = {
     request(
       `/aqi/history/${encodeURIComponent(city)}?hours=${hours}&limit=${limit}&offset=${offset}`
     ),
+  alertsStatus: () => request("/alerts/status"),
+  alertOfficials: (point) => request(`/alerts/officials/${encodeURIComponent(point)}`),
+  alertPublic: (point) => request(`/alerts/public/${encodeURIComponent(point)}`),
+  sendAlert: (payload) =>
+    request("/alerts/send", { method: "POST", body: JSON.stringify(payload) }),
 };
