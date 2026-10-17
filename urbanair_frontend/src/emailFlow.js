@@ -1,5 +1,5 @@
 // Recipient check shared by the AlertPanel form (the backend validates again
-// before handing the address to SMTP).
+// before handing the address to the email provider).
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^@\s]+$/;
 
 export function isValidEmail(value) {
@@ -17,13 +17,19 @@ export function isValidEmail(value) {
 //     success and failure paths -> the button can never stick on "Sending...".
 //   * Success and failure always produce a sendStatus message; a rejected
 //     request is NEVER reported as success.
+//
+// A success only means the email provider *accepted* the message for sending;
+// it does not guarantee inbox delivery, and the message says so.
 export async function sendEmailFlow({ sendAlert, payload, reportLabel, setSending, setSendStatus }) {
   setSending(true);
   setSendStatus(null);
   try {
     const data = await sendAlert(payload);
     const to = (data && data.to) || payload.to_email;
-    setSendStatus({ ok: true, msg: `Sent ${reportLabel} to ${to}` });
+    setSendStatus({
+      ok: true,
+      msg: `Sent ${reportLabel} to ${to} — the email provider accepted it (inbox delivery not guaranteed)`,
+    });
     return true;
   } catch (e) {
     const msg = (e && e.message) || String(e) || "Failed to send email";

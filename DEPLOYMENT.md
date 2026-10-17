@@ -287,7 +287,8 @@ retention rows are older than 7 days. It never writes or deletes.
    - `DATABASE_URL` — Supabase pooler URI (`sslmode=require`)
    - `CORS_ORIGINS` — your Vercel URL, e.g. `https://urbanair.vercel.app`
    - `FRONTEND_URL` — same Vercel URL
-   - `GROQ_API_KEY`, `SMTP_EMAIL`, `SMTP_APP_PASSWORD` (optional)
+   - `GROQ_API_KEY` (optional — powers WAQI-vs-model arbitration)
+   - `RESEND_API_KEY` / `RESEND_FROM_EMAIL` (optional — email alerts, see §6a)
 4. For `urbanair-collector`, also set `OWM_API_KEY`, `TOMTOM_API_KEY`,
    `WAQI_API_TOKEN`.
 5. Deploy. Backend health check path is `/api/health`.
@@ -299,6 +300,58 @@ build `pip install -r requirements.txt`, start
 > `$PORT` is provided by Render — the app must bind to it (the start
 > command does). Model files (~9 MB `.pkl`) ship in the repo, so no
 > separate model download is required.
+
+### 6a. Email alerts (Resend HTTPS — works on Render)
+
+Render (and most managed hosts) **block outbound SMTP ports** (25/465/587)
+to prevent spam. A direct `smtplib.SMTP_SSL("smtp.gmail.com", 465)` therefore
+fails with `[Errno 101] Network is unreachable` — a *network* failure, not a
+credentials problem. The backend therefore sends alert emails through the
+**Resend HTTPS API on port 443** (`urbanair_backend/app/notifications.py`).
+
+Set these Render environment variables (Dashboard → your service →
+**Environment**):
+
+| Key | Value | Notes |
+|---|---|---|
+| `RESEND_API_KEY` | `re_...` | Secret. Create at <https://resend.com/api-keys>. |
+| `RESEND_FROM_EMAIL` | `UrbanAir AI <alerts@yourdomain.com>` | Must be a **verified** sender/domain in Resend. For a quick test you may use `onboarding@resend.dev` (Resend's shared test sender). |
+
+Steps:
+
+1. Create a free Resend account and **verify a domain** (or sender) under
+   Resend → **Domains**. Copy the API key.
+2. Add both variables above to the Render service **and click "Save"** — this
+   triggers a redeploy.
+3. Confirm configuration: `GET /api/alerts/status` should return
+   `{"smtp_configured": true}` (the key name is legacy; it now means "an email
+   provider is configured").
+4. Send a test from the app (Enforcement tab → expand a row → **Send Email**),
+   or:
+   ```powershell
+   curl.exe -s -X POST https://urbanair-sr2m.onrender.com/api/alerts/send `
+     -H "Content-Type: application/json" `
+     -d '{\"point\":\"Delhi\",\"alert_type\":\"official\",\"to_email\":\"you@example.com\"}'
+   ```
+
+A `200` means Resend **accepted** the message for delivery; it does **not**
+guarantee inbox delivery (it can still bounce or land in spam). Only claim
+real delivery after receiving it in an inbox you control.
+
+HTTP statuses returned by `/api/alerts/send`:
+
+| Status | Meaning |
+|---|---|
+| `200` | Provider accepted the send request. |
+| `400` | Missing/invalid recipient, unknown point or `alert_type`. |
+| `502` | Provider was reachable but rejected the request (e.g. bad `from` domain, invalid `to`). |
+| `503` | No provider configured, timeout, or the provider is unreachable. |
+| `500` | Unexpected error. |
+
+> **SMTP is an optional fallback only** (kept for local/self-hosted use). It is
+> used only when `RESEND_API_KEY` is unset and `SMTP_EMAIL` + `SMTP_APP_PASSWORD`
+> are set. Do **not** rely on it in Render production — the SMTP ports are
+> blocked. When Resend is configured it always takes precedence.
 
 ---
 
@@ -369,6 +422,8 @@ render, and the browser Network tab shows calls to the Render backend
 | Frontend calls `localhost` | `VITE_API_BASE_URL` missing at **build** time; set it in Vercel and redeploy. |
 | 503 on `/api/current/{city}` | No live reading yet — collectors haven't logged. Run/await the worker. |
 | 503 on `/api/aqi/history` | DB not configured (expected in CSV-only mode). |
+| `[Errno 101] Network is unreachable` when sending email | Outbound SMTP is blocked on the host. Use Resend (`RESEND_API_KEY`/`RESEND_FROM_EMAIL`), not SMTP — see §6a. |
+| `502` from `/api/alerts/send` | Resend was reachable but rejected the send — usually an unverified `RESEND_FROM_EMAIL` domain or an invalid recipient. Check the Resend dashboard logs. |
 | `psycopg2` build error on install | Use `psycopg2-binary` (already in requirements). |
 | `No module named 'psycopg'` in Actions/Render | `DATABASE_URL` uses `postgresql+psycopg://`; install `psycopg[binary]` (already in requirements.txt). |
 | Render worker crashes with `ModuleNotFoundError: db` | Run the sync via `python -m scripts.sync_live_to_db` from `urbanair_backend/`. |
@@ -382,6 +437,7 @@ render, and the browser Network tab shows calls to the Render backend
 - [ ] Supabase connection uses `sslmode=require` (verification never disabled).
 - [ ] CORS restricted to the production frontend origin.
 - [ ] Database password / service-role key stored only in Render env vars.
+- [ ] Email provider keys (`RESEND_API_KEY`) stored only in Render env vars — never in the frontend or logs.
 - [ ] Rotate any API keys that were ever shared in a zip / chat.
 - [ ] Queries are parameterized (SQLAlchemy) — no string-built SQL.
 

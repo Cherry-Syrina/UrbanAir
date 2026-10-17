@@ -103,8 +103,8 @@ export default function AlertPanel({ point }) {
             border: "1px solid var(--border-subtle)",
           }}
         >
-          Email sending isn't configured on the server yet (SMTP credentials missing) — sending will
-          fail until it is.
+          Email sending isn't configured on the server yet (no email provider credentials) — sending
+          will fail until it is.
         </div>
       )}
 

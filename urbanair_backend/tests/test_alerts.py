@@ -1,15 +1,20 @@
 """
 Tests for the alert / email-notification endpoints (/api/alerts/*).
 
-SMTP is MOCKED here -- these tests exercise the wiring, recipient validation
-and error handling; they do NOT deliver real email. A genuine delivery test
-must be run manually against a controlled recipient with SMTP configured.
+The email provider (Resend HTTPS API, and the optional SMTP fallback) is
+MOCKED here -- these tests exercise the wiring, recipient validation, provider
+acceptance/rejection and timeout/network error handling; they do NOT deliver
+real email. A genuine delivery test must be run manually against a controlled
+inbox with a real provider key configured.
 """
 
+import os
 import sys
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
+
+import requests
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
@@ -152,3 +157,141 @@ class TestAlertSend(AlertEndpointsTestCase):
         self.assertEqual(to_email, "someone@example.com")
         self.assertIn("Air Quality Advisory", subject)
         self.assertIn("UrbanAir AI Alert", body)
+
+
+class _FakeResponse:
+    """Minimal stand-in for a requests.Response from the email provider."""
+
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no JSON body")
+        return self._payload
+
+
+RESEND_ENV = {"RESEND_API_KEY": "secret_test_key", "RESEND_FROM_EMAIL": "UrbanAir <alerts@urbanair.test>"}
+
+
+class TestProviderSelection(TestCase):
+    def test_resend_is_preferred_over_smtp(self):
+        from app import notifications
+        with patch.dict(os.environ, {**RESEND_ENV, "SMTP_EMAIL": "me@example.com", "SMTP_APP_PASSWORD": "pw"}):
+            self.assertEqual(notifications.provider(), "resend")
+            self.assertTrue(notifications.is_configured())
+
+    def test_provider_is_none_when_nothing_configured(self):
+        from app import notifications
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(notifications.provider())
+            self.assertFalse(notifications.is_configured())
+
+
+class TestResendSend(AlertEndpointsTestCase):
+    """Resend HTTPS provider, mocked at the requests.post boundary."""
+
+    def test_resend_acceptance_reports_provider_and_id(self):
+        client, main = self._client()
+        fake = _FakeResponse(200, {"id": "resend-id-123"})
+        with patch.dict(os.environ, RESEND_ENV), \
+                patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications.requests, "post", return_value=fake) as post:
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["to"], "someone@example.com")
+        self.assertEqual(body["provider"], "resend")
+        self.assertEqual(body["id"], "resend-id-123")
+        self.assertIn("subject", body)
+
+        args, kwargs = post.call_args
+        self.assertEqual(args[0], main.notifications.RESEND_API_URL)
+        connect, read = kwargs["timeout"]
+        self.assertGreater(connect, 0)
+        self.assertGreater(read, 0)
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer secret_test_key")
+        self.assertEqual(kwargs["json"]["to"], ["someone@example.com"])
+
+    def test_resend_invalid_recipient_is_400_and_never_calls_provider(self):
+        client, main = self._client()
+        with patch.dict(os.environ, RESEND_ENV), \
+                patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications.requests, "post") as post:
+            resp = self._send(client, to_email="not-an-email")
+        self.assertEqual(resp.status_code, 400)
+        post.assert_not_called()
+
+    def test_resend_provider_rejection_is_502_without_leaking_key(self):
+        client, main = self._client()
+        fake = _FakeResponse(422, {"statusCode": 422, "message": "Invalid `to` field"})
+        with patch.dict(os.environ, RESEND_ENV), \
+                patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications.requests, "post", return_value=fake):
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 502)
+        detail = resp.json()["detail"]
+        self.assertIn("rejected", detail.lower())
+        self.assertIn("422", detail)
+        self.assertIn("Invalid `to` field", detail)
+        self.assertNotIn("secret_test_key", detail)
+
+    def test_resend_auth_error_is_502_without_leaking_key(self):
+        client, main = self._client()
+        fake = _FakeResponse(401, {"message": "API key is invalid"})
+        with patch.dict(os.environ, RESEND_ENV), \
+                patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications.requests, "post", return_value=fake):
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 502)
+        self.assertNotIn("secret_test_key", resp.json()["detail"])
+
+    def test_resend_timeout_is_503(self):
+        client, main = self._client()
+        with patch.dict(os.environ, RESEND_ENV), \
+                patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications.requests, "post",
+                             side_effect=requests.exceptions.Timeout("too slow")):
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("timed out", resp.json()["detail"].lower())
+
+    def test_resend_network_error_is_503(self):
+        client, main = self._client()
+        with patch.dict(os.environ, RESEND_ENV), \
+                patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications.requests, "post",
+                             side_effect=requests.exceptions.ConnectionError("network unreachable")):
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 503)
+        detail = resp.json()["detail"]
+        self.assertIn("reach", detail.lower())
+        self.assertNotIn("secret_test_key", detail)
+
+
+class TestEmailNotConfigured(AlertEndpointsTestCase):
+    def test_missing_provider_is_503_and_never_calls_provider(self):
+        client, main = self._client()
+        with patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications, "provider", return_value=None), \
+                patch.object(main.notifications.requests, "post") as post:
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("not configured", resp.json()["detail"].lower())
+        post.assert_not_called()
+
+
+class TestSmtpFallback(AlertEndpointsTestCase):
+    def test_unreachable_smtp_port_is_503_not_500(self):
+        # Reproduces the production symptom: SMTP blocked -> OSError 101.
+        client, main = self._client()
+        with patch.dict(os.environ, {"SMTP_EMAIL": "me@example.com", "SMTP_APP_PASSWORD": "pw"}), \
+                patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications, "provider", return_value="smtp"), \
+                patch.object(main.notifications.smtplib, "SMTP_SSL",
+                             side_effect=OSError(101, "Network is unreachable")):
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("SMTP", resp.json()["detail"])

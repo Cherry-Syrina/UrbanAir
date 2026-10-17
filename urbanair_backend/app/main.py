@@ -1201,14 +1201,22 @@ def send_alert(req: SendAlertRequest):
 
     try:
         result = notifications.send_email(to_email, subject, body)
+    except notifications.EmailNotConfigured as e:
+        raise HTTPException(503, str(e))
+    except notifications.EmailTimeout:
+        raise HTTPException(503, "Email request timed out. Please try again later.")
+    except notifications.EmailNetworkError as e:
+        raise HTTPException(503, str(e))
+    except notifications.EmailProviderError as e:
+        raise HTTPException(502, str(e))
+    except TimeoutError:
+        raise HTTPException(503, "Email request timed out. Please try again later.")
     except RuntimeError as e:
         raise HTTPException(503, str(e))
-    except TimeoutError:
-        raise HTTPException(503, "SMTP request timed out. Please try again later.")
     except Exception as e:
         msg = str(e)
         if "timeout" in msg.lower():
-            raise HTTPException(503, "SMTP request timed out. Please try again later.")
+            raise HTTPException(503, "Email request timed out. Please try again later.")
         raise HTTPException(500, f"Failed to send email: {e}")
 
     return {**result, "subject": subject}
