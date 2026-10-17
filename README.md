@@ -1,137 +1,465 @@
-# UrbanAir AI — Full-Stack Prototype
+# UrbanAir AI
 
-Delhi NCR air quality monitoring + forecasting + source-attribution
-dashboard. Covers Features 1, 2, 3, 4, 5 from the Feature Freeze doc
-(Live AQI Dashboard, Hyperlocal Forecast, Source Attribution, Enforcement
-Intelligence, Health Advisory). Only the Gemini Chat Assistant and the
-What-if Simulation stretch goal remain.
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg)
+![Node](https://img.shields.io/badge/node-18%2B-339933.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688.svg)
+![React](https://img.shields.io/badge/React-18-61DAFB.svg)
 
-## Live demo
+**A full-stack decision-support dashboard for Delhi NCR air quality** — live
+monitoring, 24/48/72-hour forecasting, pollution source attribution,
+enforcement prioritisation, public health advisories, and a green-cover
+index, all computed from real data and served through a documented REST API.
 
-**Deployed app:** https://urban-air-sigma.vercel.app/
+> **Live application:** <https://urban-air-sigma.vercel.app/>
+> **Backend API:** <https://urbanair-sr2m.onrender.com/api/health>
 
-## Structure
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Monitored Areas](#monitored-areas)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [Configuration](#configuration)
+- [API Reference](#api-reference)
+- [Data Pipeline & Freshness](#data-pipeline--freshness)
+- [Persistence (Supabase, optional)](#persistence-supabase-optional)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [Design Principles](#design-principles)
+- [Scope, Assumptions & Limitations](#scope-assumptions--limitations)
+- [Data Sources](#data-sources)
+- [Screenshots](#screenshots)
+- [License](#license)
+
+---
+
+## Overview
+
+UrbanAir AI turns raw air-quality, weather, traffic and geospatial signals
+into actionable output for the people who act on pollution — municipal
+officials and the public. It covers the five pillars of the original
+specification:
+
+| # | Pillar | What it delivers |
+|---|---|---|
+| 1 | **Live AQI Dashboard** | Real-time AQI, pollutant breakdown and map for every monitored area |
+| 2 | **Hyperlocal Forecast** | 24/48/72-hour AQI forecasts with category bands |
+| 3 | **Source Attribution** | Explainable Traffic / Industrial / Construction / Waste-burning / Background split |
+| 4 | **Enforcement Intelligence** | Ranked priority list with reasons and recommended actions |
+| 5 | **Health Advisory** | CPCB-band guidance for the general public and sensitive groups |
+
+Two stretch features are also implemented: a **Green Cover Index** and a
+**What-if Simulation**.
+
+The system is deliberately **transparent and explainable** — the
+source-attribution and enforcement engines are documented rule engines
+rather than opaque models, and every estimate carries its caveats in the
+API response and the UI (see [Scope, Assumptions & Limitations](#scope-assumptions--limitations)).
+
+---
+
+## Features
+
+- **Live monitoring** — AQI + PM2.5/PM10/NO₂/O₃/CO/SO₂ readings per area,
+  with an instrument-style gauge and severity colouring based on official
+  CPCB bands.
+- **Forecasting** — one model per city predicting AQI at 24/48/72h horizons.
+- **Source attribution** — combines live traffic congestion, wind
+  direction/speed, proximity to industrial/construction zones and a
+  seasonal stubble-burning heuristic into a five-way percentage split.
+- **Enforcement ranking** — prioritises areas by forecast severity, source
+  mix and traffic load, with plain-language reasons and recommended actions.
+- **Health advisories** — current and forecast guidance for general and
+  sensitive groups.
+- **Alert delivery** — generate an Official Report or a Public Advisory and
+  send it as an email, over the Resend HTTPS API (SMTP supported as an
+  optional fallback).
+- **Hyperlocal estimates** — search any NCR location or click anywhere on
+  the map to get an estimate (AQI/forecast proxied from the nearest trained
+  city; source attribution computed fresh for the exact point).
+- **Green Cover Index** — tree-cover %, estimated population, green area
+  per capita and an illustrative tree-count gap for each area, aligned with
+  the *Ek Ped Maa Ke Naam* afforestation campaign.
+- **What-if simulation** — sliders to model reducing each source by X% and
+  see the resulting AQI improvement.
+
+---
+
+## Architecture
 
 ```
-urbanair_backend/     ← FastAPI (models + rule engines + data API)
-urbanair_frontend/    ← React + Leaflet + Recharts dashboard
+┌──────────────────┐    HTTPS / JSON    ┌────────────────────────┐
+│    Frontend      │ ─────────────────▶ │   Backend (FastAPI)     │
+│  React + Vite    │ ◀───────────────── │   ML + rule engines     │
+│   (Vercel)       │                    │   (Render)              │
+└──────────────────┘                    └───────────┬────────────┘
+                                                      │ SQLAlchemy
+                                                      ▼
+                                          ┌────────────────────────┐
+                                          │   Supabase Postgres     │
+                                          │  (optional, recommended)│
+                                          └───────────▲────────────┘
+                                                      │ upsert (dedup)
+                        ┌─────────────────────────────┴───────────────┐
+                        │  Collectors (GitHub Actions cron or local)   │
+                        │  OWM · TomTom · WAQI → CSV → sync_live_to_db  │
+                        │  then persist_derived (forecasts, attribution)│
+                        └──────────────────────────────────────────────┘
 ```
 
-## Database (Supabase PostgreSQL) — optional but recommended
+The application is fully functional in **CSV-only mode**; Supabase adds
+persistence (historical AQI, persisted forecasts, attribution snapshots and
+enforcement alerts). Every feature works with or without a database.
 
-The app runs in **CSV-only mode** by default. Add Supabase for
-persistence (historical AQI, persisted forecasts, source-attribution
-snapshots, enforcement alerts). Nothing else changes — every feature keeps
-working with or without it.
+---
 
-- Schema: [`database/schema.sql`](database/schema.sql) — idempotent,
-  never drops data. Apply it in the Supabase SQL Editor.
-- Backend tables (SQLAlchemy, see `urbanair_backend/db/models.py`):
-  `stations`, `aqi_readings`, `weather_readings`, `aqi_forecasts`,
-  `pollution_source_estimates`, `enforcement_alerts`.
-- Historical import: `python -m scripts.import_historical`
-  (from `urbanair_backend/`) — imports the 2019–2024 dataset,
-  duplicate-safe and non-destructive.
-- Live sync: `python -m scripts.sync_live_to_db` (idempotent).
-- New endpoints: `GET /api/db/health`,
-  `GET /api/aqi/history/{city}?hours=&limit=&offset=`,
-  `GET /api/forecasts/{city}`, `GET /api/alerts`.
+## Tech Stack
 
-Set `DATABASE_URL` (Supabase pooler URI, `sslmode=require`) in
-`urbanair_backend/.env`. Full instructions: **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+| Layer | Technology |
+|---|---|
+| Backend | Python, FastAPI, SQLAlchemy 2, Pydantic |
+| ML / data | scikit-learn, LightGBM, CatBoost, pandas, NumPy, joblib, rasterio |
+| Database | PostgreSQL (Supabase) — optional |
+| Frontend | React 18, Vite 5, Leaflet / react-leaflet, Recharts |
+| Email | Resend HTTPS API (SMTP fallback) |
+| LLM (optional) | Groq for WAQI-vs-model arbitration |
+| Automation | GitHub Actions (collectors + sync) |
+| Hosting | Render (backend), Vercel (frontend), Supabase (database) |
 
-> ⚠️ Security: the shipped `aqi_model/.env` and `urbanair_backend/.env`
-> contain real API keys (they were bundled for offline demo use). They are
-> git-ignored, but **rotate them** if this project was ever shared as a
-> zip/archive. Never put database credentials or the Supabase service-role
-> key in `VITE_*` frontend variables.
+---
 
+## Monitored Areas
 
-## Run it (full setup, start to end)
+**21 areas** across Delhi NCR:
 
-**Prerequisites:** Python 3.10+ and Node.js 18+. API keys are already
-included in `.env` (aqi_model/) and `.env` (urbanair_backend/) — nothing
-to sign up for, just install and run.
+- **5 NCR cities** — Delhi, Faridabad, Ghaziabad, Gurgaon, Noida
+- **13 designated pollution hotspots** — Anand Vihar, Ashok Vihar, Bawana,
+  Dwarka, Jahangirpuri, Mundka, Narela, Okhla, Punjabi Bagh, R.K. Puram,
+  Rohini, Vivek Vihar, Wazirpur
+- **3 landmarks** — Chandni Chowk, Red Fort, Connaught Place
 
-You'll end up with **3 terminals running at once** — collectors, backend,
-frontend. Start them in this order.
+Hotspot locations follow the Dept. of Environment (GNCTD), 2018 list.
+Coordinates are approximate locality centroids — cross-check against
+CPCB's official CAAQMS station list for monitoring-grade precision.
 
-### 1. Unzip and go to the project root
-```bash
-unzip urbanair_full_stack.zip
-cd urbanair_full_stack
+---
+
+## Project Structure
+
+```
+urbanair_full_stack/
+├── aqi_model/              # Data collection + model training
+│   ├── run_all.py          # Runs all collectors on a loop
+│   ├── *_collector.py       # OWM air, TomTom traffic, OWM weather, WAQI AQI
+│   ├── train_model.py       # AQI nowcast model
+│   ├── train_forecast_model.py  # 24/48/72h forecast models
+│   └── *.geojson / *.csv    # Static geospatial + processed datasets
+├── urbanair_backend/       # FastAPI service
+│   ├── app/                # main.py, alert_generator, notifications, groq_arbiter
+│   ├── db/                 # SQLAlchemy models, repository, service
+│   ├── scripts/            # schema import, live sync, derived persistence, self-tests
+│   ├── models/             # nowcast model artifacts
+│   ├── models_forecast/    # forecast model artifacts
+│   └── tests/              # unittest suite
+├── urbanair_frontend/      # React + Vite dashboard
+│   └── src/                # App, components, api client
+├── database/schema.sql     # Idempotent Supabase schema
+├── .github/workflows/      # collect.yml — scheduled data collection
+├── DEPLOYMENT.md           # Full deployment guide
+├── FREE_DEMO_DATA.md       # Free data-freshness setup
+├── render.yaml             # Render blueprint
+└── LICENSE
 ```
 
-### 2. Terminal 1 — live-data collectors (`aqi_model/`)
+---
+
+## Getting Started
+
+### Prerequisites
+
+- **Python 3.11+** (3.11 recommended for hosted builds)
+- **Node.js 18+**
+- API keys for the collectors are included in the bundled `.env` files for
+  offline/demo use — nothing to sign up for to run locally.
+
+You will run **three processes**: the collectors, the backend, and the
+frontend. Start them in that order.
+
+### 1. Collectors — `aqi_model/`
+
 ```bash
 cd aqi_model
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-
 python run_all.py
 ```
-`.env` with the API keys is already in this folder — no setup needed
-there. Leave this running. `run_all.py` starts all 4 collectors (air
-pollution, traffic, weather, WAQI ground AQI) on loop, **and** syncs the
-logs it produces into `urbanair_backend/` every 5 minutes automatically —
-this single command replaces running each collector separately and the
-old `sync_logs.ps1`. Give it a minute or two after first starting so each
-collector has logged at least one row before you open the dashboard —
-the backend returns a 503 for a city until its first live reading lands.
 
-### 3. Terminal 2 — backend (`urbanair_backend/`)
+`run_all.py` starts all four collectors (air pollution, traffic, weather,
+WAQI ground AQI) on a loop and mirrors the CSVs it produces into
+`urbanair_backend/` every five minutes. Leave it running. Wait a minute or
+two after first start so at least one reading is logged — the backend
+returns `503` for a city until its first live reading arrives.
+
+### 2. Backend — `urbanair_backend/`
+
 ```bash
-cd urbanair_full_stack
 cd urbanair_backend
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-
 python -m uvicorn app.main:app --reload --port 8000
 ```
-`.env` (email + Groq arbitration keys) is already included here too —
-nothing else to configure.
 
-### 4. Terminal 3 — frontend (`urbanair_frontend/`)
+Verify: <http://127.0.0.1:8000/api/health>
+
+### 3. Frontend — `urbanair_frontend/`
+
 ```bash
-cd urbanair_full_stack
 cd urbanair_frontend
 npm install
 npm run dev
 ```
 
-Open **http://localhost:5173** — the Vite dev server proxies `/api/*` to
-the FastAPI backend on port 8000 automatically (see `vite.config.js`).
+Open <http://localhost:5173>. The Vite dev server proxies `/api/*` to the
+FastAPI backend on port 8000 (see `vite.config.js`).
 
-### Day-to-day after first setup
-Only Terminal 1 (`python run_all.py`, from inside `aqi_model/` with its
-venv active) needs to be kept running for fresh data — leave it up
-whenever you want the dashboard showing live numbers. Backend and
-frontend can be started/stopped independently of it.
+### Day-to-day
 
-## What it does
+Only the collectors (`run_all.py`) need to stay running for fresh data.
+The backend and frontend can be started and stopped independently.
 
-Four tabs:
+---
 
-- **Overview** — Map (Leaflet, dark CARTO basemap) with 5 city markers
-  colored by live AQI severity, toggleable layers (parks/industrial/
-  construction/residential/roads), instrument-style AQI gauge, pollutant
-  readings, 24/48/72h forecast panel, 7-day trend chart.
-- **Source Attribution** — donut chart breaking down Traffic / Industrial
-  / Construction / Waste-Burning / Regional Background % for the
-  selected city, using live traffic congestion + wind direction/speed +
-  proximity to industrial/construction zones + a seasonal stubble-burning
-  heuristic.
-- **Enforcement** — ranked priority list across all monitored points
-  (5 cities + Anand Vihar + Rohini hotspots), each with plain-language
-  reasons and recommended actions, driven by forecast severity + source
-  mix + traffic congestion.
-- **Health Advisory** — current + forecast CPCB-band health advisory
-  text for general public and sensitive groups.
+## Configuration
 
+All configuration is via environment variables. Copy the relevant
+`.env.example` and fill in your values — never commit real `.env` files.
 
-##  Application Screenshots
+**Backend (`urbanair_backend/.env`)**
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` / `SUPABASE_DB_URL` | Supabase pooler URI (`sslmode=require`). Optional. |
+| `CORS_ORIGINS`, `FRONTEND_URL` | Allowed browser origin(s) in production. |
+| `RESEND_API_KEY`, `RESEND_FROM_EMAIL` | Email alerts over the Resend HTTPS API (recommended). |
+| `SMTP_EMAIL`, `SMTP_APP_PASSWORD`, `SMTP_HOST`, `SMTP_PORT` | Optional SMTP fallback. |
+| `GROQ_API_KEY` | Optional WAQI-vs-model arbitration in `/api/current`. |
+| `DB_ECHO`, pool knobs | Tuning / diagnostics. |
+
+**Frontend (`urbanair_frontend/.env`)**
+
+| Variable | Purpose |
+|---|---|
+| `VITE_API_BASE_URL` | Backend base URL including `/api` (required in production). |
+| `VITE_DEV_PROXY_TARGET` | Backend target for the dev proxy. |
+| `VITE_MAP_TILE_URL` | Optional custom map tile URL. |
+
+**Collectors (`aqi_model/.env`)**
+
+`TOMTOM_API_KEY`, `OWM_API_KEY`, `WAQI_API_TOKEN`.
+
+> **Email note:** managed hosts such as Render block outbound SMTP ports
+> (25/465/587), which causes `[Errno 101] Network is unreachable`. Use the
+> **Resend** variables above in production; SMTP is a fallback only.
+> A successful send means the provider *accepted* the message — it does not
+> guarantee inbox delivery.
+
+---
+
+## API Reference
+
+Base URL: `https://urbanair-sr2m.onrender.com` (or `http://localhost:8000`).
+
+**Health**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/health` | Liveness + whether a database is configured |
+| GET | `/api/db/health` | Real database connectivity check |
+
+**Air quality**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/cities` | Monitored cities + coordinates |
+| GET | `/api/current/{city}` | Latest AQI + pollutant readings |
+| POST | `/api/nowcast` | AQI from manually entered pollutant readings |
+| GET | `/api/forecast/{city}` | 24/48/72h forecast |
+| GET | `/api/historical/{city}?hours=` | Time series for the trend chart |
+| GET | `/api/aqi/history/{city}` | Paginated persisted AQI history |
+| GET | `/api/forecasts/{city}` | Latest persisted forecasts |
+
+**Geospatial**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/geojson/{layer}` | Layer geometry (`parks` \| `residential` \| `industrial` \| `construction` \| `roads`) |
+| GET | `/api/search-location?query=` | Geocoding (Nominatim), NCR-bounded |
+| GET | `/api/estimate?lat=&lon=` | Hyperlocal estimate for any point |
+
+**Attribution & enforcement**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/source-attribution` | Source split for all monitored areas |
+| GET | `/api/source-attribution/{point}` | Source split for one area |
+| GET | `/api/enforcement` | Ranked priority list with reasons + actions |
+| GET | `/api/alerts` | Persisted enforcement alerts |
+
+**Alerts & advisories**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/alerts/officials/{point}` | Official report text |
+| GET | `/api/alerts/public/{point}` | Public advisory text |
+| POST | `/api/alerts/send` | Send a report/advisory by email |
+| GET | `/api/alerts/status` | Whether an email provider is configured |
+| GET | `/api/health-advisory/{city}` | Current + forecast health advisory |
+| GET | `/api/health-advisory` | Health advisory for all areas |
+
+**Green cover & simulation**
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/api/green-cover` | Green Cover Index for all areas |
+| GET | `/api/green-cover/{point}` | Green Cover Index for one area |
+| POST | `/api/whatif` | Simulate reducing sources by X% |
+
+Interactive OpenAPI docs are available at `/docs`.
+
+---
+
+## Data Pipeline & Freshness
+
+The backend **reads** data; it does not collect it. Collection runs
+separately.
+
+- **Local:** `python run_all.py` (from `aqi_model/`) loops the collectors
+  and mirrors the latest CSVs into `urbanair_backend/` every five minutes.
+- **Production (free):** the `.github/workflows/collect.yml` GitHub Actions
+  job runs the collectors every 30 minutes and syncs into Supabase via
+  `python -m scripts.sync_live_to_db`, then computes derived data
+  (forecasts, source attribution) with `python -m scripts.persist_derived`.
+  See [FREE_DEMO_DATA.md](FREE_DEMO_DATA.md).
+- **Production (paid):** an always-on Render Background Worker running
+  `python run_all.py` (commented out in `render.yaml`).
+
+The backend re-reads its inputs on every request, so no restart is needed
+after new data lands.
+
+---
+
+## Persistence (Supabase, optional)
+
+Adding Supabase enables historical AQI, persisted forecasts,
+source-attribution snapshots and enforcement alerts. Nothing else changes.
+
+1. Apply [`database/schema.sql`](database/schema.sql) in the Supabase SQL
+   Editor (idempotent, never drops data).
+2. Import history (optional):
+   `python -m scripts.import_historical` — duplicate-safe, non-destructive.
+3. Keep live data flowing with
+   `python -m scripts.sync_live_to_db` (idempotent).
+
+Full instructions, including backup and dry-run guidance, are in
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
+---
+
+## Testing
+
+**Backend** (from `urbanair_backend/`):
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+The suite covers the API, database layer and pooling, CSV fallback,
+derived-data persistence, schema import/sync, alert/email handling
+(provider mocked) and batching regressions.
+
+**Frontend** (from `urbanair_frontend/`):
+
+```bash
+npm test        # node --test
+npm run build   # production build
+```
+
+---
+
+## Deployment
+
+The stack deploys to **Render** (backend), **Vercel** (frontend) and
+**Supabase** (database). Step-by-step instructions — including environment
+variables, the Supabase schema, the Resend email setup and troubleshooting —
+are in **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+
+A `render.yaml` blueprint provisions the backend web service; the frontend
+is deployed separately on Vercel with root directory `urbanair_frontend`.
+
+---
+
+## Design Principles
+
+UrbanAir AI is built as a **control-room interface**, not a marketing page —
+its audience is officials monitoring live conditions. A dark base lets
+severity colours read clearly, monospace type (IBM Plex Mono) is used for
+all numeric readouts to feel measured, and Space Grotesk for headings. The
+AQI severity palette follows official CPCB bands and is kept distinct from
+the app's own accent colour, so a real pollution reading is never confused
+with branding.
+
+Explainability is a feature: the rule engines expose *why* they reached a
+conclusion, which is a stronger pitch for a government-facing tool than an
+opaque model.
+
+---
+
+## Scope, Assumptions & Limitations
+
+This is a **prototype / decision-support tool**, and it is honest about its
+bounds:
+
+- **Source attribution and enforcement are transparent rule engines**, not
+  trained classifiers. There is no labelled ground-truth dataset for
+  "true pollution source" (real-world source apportionment uses
+  dispersion-model hybrids too). Every weight is a documented assumption
+  based on known atmospheric behaviour — not a fitted parameter.
+- **What-if simulation** is a linear-scaling scenario estimate, not a
+  validated dispersion model. It is labelled as such in the API response
+  and the UI.
+- **Green Cover** population figures are district-density estimates, not
+  exact ward census counts, and the "trees needed" number is illustrative.
+  The 9 m²/person benchmark is a planning reference, not a regulatory
+  mandate.
+- **Email alerts are demo-grade**, not a government notification system. A
+  real deployment would use the official channel (SMS gateway, internal
+  alert queue, WhatsApp Business API, etc.). A successful send means the
+  provider accepted the message, not that it reached an inbox.
+- **Hotspot coordinates** are approximate locality centroids.
+
+---
+
+## Data Sources
+
+- **OpenWeatherMap** — air pollution and weather
+- **TomTom** — traffic congestion
+- **WAQI / CPCB** — ground-truth AQI
+- **ESA WorldCover (2021)** via Google Earth Engine — tree cover
+- **Census 2011** — district population density
+- **OpenStreetMap** — geospatial layers
+- Historical dataset: `processed_aqi_data.csv` (5 cities, hourly, 2019–2024)
+
+---
+
+## Screenshots
 
 ### Dashboard
 ![Dashboard](assets/dashboard.png)
@@ -151,190 +479,10 @@ Four tabs:
 ### What-if Simulation
 ![What-if Simulation](assets/what-if-simulation.png)
 
-## Design direction
+---
 
-Built as a control-room / instrumentation interface (not a marketing
-page) since the actual audience is DPCC/MCD officials monitoring live
-conditions: dark base so severity colors read clearly, monospace
-(IBM Plex Mono) for all numeric readouts to feel measured, Space Grotesk
-for headers. The AQI severity palette carries real meaning (CPCB bands),
-kept separate from the app's own accent color (teal) so users never
-confuse "the brand color" with "a pollution reading."
+## License
 
-## API endpoints (backend)
+Released under the [MIT License](LICENSE).
 
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/cities` | List of 5 cities + coordinates |
-| `GET /api/current/{city}` | Latest known AQI + pollutants |
-| `POST /api/nowcast` | AQI from manually entered pollutant readings |
-| `GET /api/forecast/{city}` | 24/48/72h forecast (optional `reference_time` for demo/backtest mode) |
-| `GET /api/historical/{city}?hours=168` | Time series for the trend chart |
-| `GET /api/geojson/{layer}` | `parks` \| `residential` \| `industrial` \| `construction` \| `roads` |
-| `GET /api/source-attribution` | Traffic/Industrial/Construction/Waste-Burning/Background % for all points |
-| `GET /api/source-attribution/{point}` | Same, for one city or hotspot |
-| `GET /api/enforcement` | Ranked priority list with reasons + recommended actions |
-| `GET /api/health-advisory/{city}` | Current + forecast health advisory (CPCB-band text) |
-
-## Keeping traffic/weather/AQI data fresh
-
-`source_attribution.py`, `main.py`, and `live_history.py` all read their
-live CSVs (`traffic_log.csv`, `weather_current_log.csv`,
-`live_pollutants_log.csv`, `live_ground_aqi_log.csv`) **from inside
-`urbanair_backend/`**, but the collectors in `aqi_model/` write to
-`aqi_model/` instead. `python run_all.py` (see setup above) handles
-copying the latest files across automatically every 5 minutes — as long
-as it's running, you don't need to think about this. If you ever see
-stale numbers, check that Terminal 1 (`run_all.py`) is still alive.
-
-No backend restart is needed either way — it re-reads the CSVs on every
-request.
-
-## Important note on Source Attribution / Enforcement
-
-These are **transparent rule-based engines**, not trained ML classifiers
--- there's no labeled "ground truth pollution source" dataset to train
-against (this is true of real-world source apportionment too; CPCB/SAFAR
-use similar rule + dispersion-model hybrids, not pure ML). Every weight
-in `source_attribution.py` is a documented assumption based on known
-atmospheric behavior (wind carries industrial/agricultural smoke, calm
-wind concentrates pollutants, stubble burning is seasonal Oct-Nov), not a
-fitted parameter. This is honest to present in your report/demo as
-"explainable rule-based reasoning" -- arguably a stronger pitch for a
-government-facing tool than an opaque model would be.
-
-## Recent additions (v3)
-
-- **Area-wise granularity**: expanded from 7 points to Delhi's **13
-  officially designated pollution hotspots** (Anand Vihar, Ashok Vihar,
-  Bawana, Dwarka, Jahangirpuri, Mundka, Narela, Okhla, Punjabi Bagh,
-  R.K. Puram, Rohini, Vivek Vihar, Wazirpur -- per Dept. of Environment,
-  GNCTD, 2018) plus 3 iconic landmarks (Chandni Chowk, Red Fort,
-  Connaught Place). Source Attribution, Enforcement, and What-if now all
-  work at this area level, not just city level. Coordinates are
-  approximate locality centroids -- cross-check against CPCB's official
-  CAAQMS station list if you need monitoring-station-grade precision
-  (link is in `source_attribution.py`'s comments).
-- **Alert generation + sending**: each row in the Enforcement tab has an
-  "Alert" button that expands to show two previews -- an **Official
-  Report** (structured analysis: AQI, forecast, source breakdown, why
-  flagged, recommended actions) and a **Public Advisory** (short,
-  Hinglish, actionable message). Both can be sent as a real email via
-  `/api/alerts/send`.
-
-### Email alerts
-
-Already configured in the included `.env` — no setup needed.
-
-Restart the backend. Without this, alert *preview* still works fully --
-only actual sending needs the SMTP credentials. `GET /api/alerts/status`
-tells you if it's configured.
-
-**This is a demo-grade email sender, not a government notification
-system.** A real deployment would replace this with whatever official
-channel DPCC/MCD uses (SMS gateway, internal alert queue, WhatsApp
-Business API, etc.) -- say this explicitly if asked in the demo, don't
-imply this is production-ready infrastructure.
-
-### New endpoints
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/alerts/officials/{point}` | Generates structured analysis report text |
-| `GET /api/alerts/public/{point}` | Generates short public advisory text |
-| `POST /api/alerts/send` | Sends either as an email (needs SMTP configured) |
-| `GET /api/alerts/status` | Whether SMTP is configured |
-
-## What's left
-
-- **Gemini Chat Assistant** — wrap the above endpoints' outputs as
-  context for a Gemini API call, answering questions like "why is AQI
-  increasing in Anand Vihar" using the already-computed attribution +
-  forecast data. This is the fastest remaining feature to build since
-  all the underlying data is ready.
-
-## Recent additions (v4) — Green Cover Index
-
-Ties to the **Ek Ped Maa Ke Naam** (One Tree in Mother's Name) national
-afforestation campaign. For each of the 21 areas:
-
-- **Tree cover %** from ESA WorldCover 10m satellite data (2021, free,
-  via Google Earth Engine) within a 2km radius
-- **Estimated population** from Census 2011 district-level density
-  (see `green_cover.py`'s `POPULATION_DENSITY` table for exactly which
-  district was assigned to each area, and why)
-- **Green sq.m per capita** vs. the widely-cited 9 sq.m/person planning
-  benchmark
-- **Illustrative tree count needed** to close the gap
-
-**Important honesty notes** (also returned in every API response's
-`caveats` field, and shown in the UI):
-- Population figures are district-density estimates, not exact ward
-  census counts -- ward-level population data would need an MCD ward
-  shapefile + matching table, which isn't publicly easy to source.
-- The "trees needed" number is illustrative (area deficit ÷ average
-  mature-tree canopy size), not a literal planting order -- actual
-  reforestation planning needs species selection, site surveys, etc.
-- The 9 sq.m/person figure is a commonly cited planning reference in
-  urban literature, but isn't traceable to one single official WHO
-  document -- treat it as a benchmark, not a regulatory mandate.
-
-If you get access to real ward-level population data (Census or MCD),
-replace the `POPULATION_DENSITY` dict in `green_cover.py` with an actual
-per-area lookup -- the rest of the pipeline doesn't need to change.
-
-### New endpoints
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/green-cover` | Green Cover Index for all 21 areas |
-| `GET /api/green-cover/{point}` | Same, for one area |
-
-### Regenerating the tree-cover raster
-
-`gee_tree_cover_extraction.js` (in `aqi_model/`) is the Google Earth
-Engine script used to generate `DelhiNCR_TreeCover_2021.tif`. Re-run it
-in the GEE Code Editor if you need a different year, radius, or region.
-
-## Recent additions (v2)
-
-- **Fixed date bug**: the AQI gauge was showing "01 Jan, 12:00 am"
-  because `/api/current` returned the historical dataset's last row
-  timestamp (which ends Jan 2024). Now shows the real current time, with
-  a small "est. from last known reading (01 Jan 2024)" note for honesty
-  about the data source.
-- **Search any location** — a search bar (top-left of the map) using free
-  OpenStreetMap Nominatim geocoding, restricted to the Delhi NCR bbox.
-  Type any place name, click a result, map flies there and shows an
-  estimate.
-- **Click anywhere on the map** — same estimate popup, for any point you
-  click, not just the 5 pre-registered cities. AQI/forecast are proxied
-  from the nearest trained city (labeled honestly), but **Source
-  Attribution is computed fresh** for the exact clicked point using the
-  static geospatial layers + nearest live traffic/weather -- this part is
-  genuinely hyperlocal.
-- **Compare-all view** in the Source Attribution tab — a stacked bar
-  chart showing Traffic/Industrial/Construction/Waste-Burning/Background
-  % side-by-side for all 7 monitored points at once, so you can see at a
-  glance which location has which dominant source (e.g. Anand Vihar's
-  industrial contribution stands out clearly against the other points).
-- **What-if Simulation tab** — sliders to simulate reducing
-  Traffic/Industrial/Construction/Waste-Burning by X%, shows before/after
-  AQI and % improvement. Method: splits current AQI into a "background"
-  floor (not locally controllable) and a "local" component distributed
-  across sources per their attribution %, then applies the requested
-  reduction to each slice. This is a rough linear-scaling estimate for
-  scenario comparison, not a validated dispersion-model simulation --
-  documented clearly in the API response's `disclaimer` field and worth
-  saying out loud in your demo too. Population-impact estimates aren't
-  included since we don't have ward-level census data -- don't fabricate
-  that number if asked; say it needs that data source.
-
-### New endpoints
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/search-location?query=...` | Free-text geocoding (Nominatim), NCR-bounded |
-| `GET /api/estimate?lat=..&lon=..` | Hyperlocal estimate for ANY point (not just the 5 cities) |
-| `POST /api/whatif` | Simulate reducing sources by X%, get before/after AQI |
-| `GET /api/source-attribution` (no path param) | All 7 points at once, for the compare view |
+© 2026 UpmaShukla276.
