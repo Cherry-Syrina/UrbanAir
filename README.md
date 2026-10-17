@@ -6,6 +6,10 @@ dashboard. Covers Features 1, 2, 3, 4, 5 from the Feature Freeze doc
 Intelligence, Health Advisory). Only the Gemini Chat Assistant and the
 What-if Simulation stretch goal remain.
 
+## Live demo
+
+**Deployed app:** https://urban-air-sigma.vercel.app/
+
 ## Structure
 
 ```
