@@ -373,7 +373,7 @@ class TestEnforcementRanking(FallbackTestCase):
         with patch.object(main, "source_attribution_all",
                           return_value=[self._attr("Delhi"), self._attr("Faridabad")]), \
                 patch.object(main, "get_current",
-                             side_effect=lambda city: {"aqi": _cur(city), "category": "Moderate"}), \
+                             side_effect=lambda city, snapshot=None: {"aqi": _cur(city), "category": "Moderate"}), \
                 patch.object(main, "forecast",
                              side_effect=HTTPException(503, "no forecast")), \
                 patch.object(main.db_service, "persist_enforcement", return_value=0):

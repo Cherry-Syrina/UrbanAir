@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from . import models
@@ -295,6 +295,100 @@ def get_latest_pollutant_reading(session, station_name: str) -> Optional[dict]:
     return _aqi_to_dict(row) if row is not None else None
 
 
+# --------------------------------------------------------------------------- #
+# Bulk latest-only reads
+#
+# The all-points endpoints (/api/enforcement, /api/health-advisory) used to
+# call get_latest_reading()/get_latest_pollutant_reading()/get_latest_forecasts()
+# once PER POINT, each opening its own connection. Against a remote pooler that
+# is ~1s per checkout, so 21 points x 5 sessions made a single request take ~85s.
+# These functions fetch the same "latest row per station" for a whole set of
+# stations in ONE query so the caller can serve everything from one connection.
+# --------------------------------------------------------------------------- #
+def _latest_reading_ids_subquery(names, only_with_pollutants: bool = False):
+    """Subquery of ``reading_id`` = the newest row per station for `names`."""
+    rn = func.row_number().over(
+        partition_by=models.AqiReading.station_id,
+        order_by=models.AqiReading.observed_at.desc(),
+    ).label("rn")
+    stmt = (
+        select(models.AqiReading.id.label("reading_id"), rn)
+        .join(models.Station, models.AqiReading.station_id == models.Station.id)
+        .where(models.Station.name.in_(list(names)))
+    )
+    if only_with_pollutants:
+        has_any = or_(*[getattr(models.AqiReading, c).isnot(None) for c in _POLLUTANT_COLS])
+        stmt = stmt.where(has_any)
+    return stmt.subquery()
+
+
+def _fetch_latest_readings(session, names, only_with_pollutants: bool = False) -> list:
+    names = list(names)
+    if not names:
+        return []
+    ranked = _latest_reading_ids_subquery(names, only_with_pollutants=only_with_pollutants)
+    stmt = (
+        select(models.AqiReading, models.Station.name)
+        .join(models.Station, models.AqiReading.station_id == models.Station.id)
+        .join(ranked, models.AqiReading.id == ranked.c.reading_id)
+        .where(ranked.c.rn == 1)
+    )
+    return [_aqi_to_dict(row, name) for row, name in session.execute(stmt).all()]
+
+
+def get_latest_readings(session, names) -> list:
+    """Newest stored observation per station name (one row each), in one query."""
+    return _fetch_latest_readings(session, names, only_with_pollutants=False)
+
+
+def get_latest_pollutant_readings(session, names) -> list:
+    """Newest observation carrying a genuine pollutant concentration per station
+    name (one row each), in one query. Mirrors get_latest_pollutant_reading()."""
+    return _fetch_latest_readings(session, names, only_with_pollutants=True)
+
+
+def get_latest_forecasts_many(session, names) -> dict:
+    """Latest forecast per (station, horizon) for many stations, in ONE query.
+
+    Returns ``{station_name: [forecast_dict, ...]}`` (sorted by horizon),
+    matching get_latest_forecasts() for a single station but without the
+    per-station round trip."""
+    names = list(names)
+    if not names:
+        return {}
+    stmt = (
+        select(models.AqiForecast, models.Station.name)
+        .join(models.Station, models.AqiForecast.station_id == models.Station.id)
+        .where(models.Station.name.in_(names))
+        .order_by(models.AqiForecast.generated_at.desc())
+    )
+    latest = {}
+    for row, name in session.execute(stmt).all():
+        key = (name, row.horizon_hours)
+        if key not in latest:
+            latest[key] = (row, name)
+    grouped: dict = {}
+    for (name, _horizon), (row, station_name) in latest.items():
+        grouped.setdefault(name, []).append(_forecast_to_dict(row, station_name))
+    for rows in grouped.values():
+        rows.sort(key=lambda r: (r["horizon_hours"] if r["horizon_hours"] is not None else 0))
+    return grouped
+
+
+def get_station_ids(session, names) -> dict:
+    """``{station_name: station_id}`` for existing stations, in one query.
+
+    Lets the persistence helpers resolve every point's id up front instead of
+    issuing one SELECT per point."""
+    names = list(names)
+    if not names:
+        return {}
+    rows = session.execute(
+        select(models.Station.name, models.Station.id).where(models.Station.name.in_(names))
+    ).all()
+    return {name: sid for name, sid in rows}
+
+
 def get_recent_readings(session, station_name: str, limit: int, since=None) -> list:
     """Latest `limit` stored observations for a station, newest first.
 
@@ -350,9 +444,12 @@ def _iso(dt) -> Optional[str]:
     return dt.isoformat() if dt is not None else None
 
 
-def _aqi_to_dict(r: models.AqiReading) -> dict:
+def _aqi_to_dict(r: models.AqiReading, station_name: Optional[str] = None) -> dict:
+    # `station_name` is passed by the bulk readers so they never touch the
+    # ``r.station`` relationship (which would lazy-load and issue one extra
+    # query per row -- the very N+1 this layer avoids).
     return {
-        "station": r.station.name if r.station else None,
+        "station": station_name if station_name is not None else (r.station.name if r.station else None),
         "timestamp": _iso(r.observed_at),
         "aqi": r.aqi,
         "category": r.aqi_category,
@@ -362,9 +459,9 @@ def _aqi_to_dict(r: models.AqiReading) -> dict:
     }
 
 
-def _forecast_to_dict(r: models.AqiForecast) -> dict:
+def _forecast_to_dict(r: models.AqiForecast, station_name: Optional[str] = None) -> dict:
     return {
-        "station": r.station.name if hasattr(r, "station") and r.station else None,
+        "station": station_name if station_name is not None else (r.station.name if hasattr(r, "station") and r.station else None),
         "generated_at": _iso(r.generated_at),
         "target_at": _iso(r.target_at),
         "horizon_hours": r.horizon_hours,

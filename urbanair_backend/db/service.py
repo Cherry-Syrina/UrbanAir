@@ -173,12 +173,18 @@ def persist_source_attribution(results: list) -> int:
     try:
         with session_scope() as session:
             rows = []
+            # Resolve every point's station id in one SELECT, then create only
+            # the ones that are genuinely missing (one extra statement each).
+            points = [r.get("point") for r in results if _coord(r.get("point"))]
+            station_ids = repository.get_station_ids(session, points)
             for r in results:
                 point = r.get("point")
                 coords = _coord(point)
                 if coords is None:
                     continue
-                station_id = repository.ensure_station(session, point, *coords)
+                station_id = station_ids.get(point)
+                if station_id is None:
+                    station_id = repository.ensure_station(session, point, *coords)
                 generated_at = _as_aware(r.get("reference_time")) or datetime.now(timezone.utc)
                 sources = r.get("sources") or {}
                 raw = r.get("raw_signals") or {}
@@ -228,12 +234,16 @@ def persist_enforcement(priorities: list) -> int:
     try:
         with session_scope() as session:
             rows = []
+            points = [p.get("point") for p in priorities if _coord(p.get("point"))]
+            station_ids = repository.get_station_ids(session, points)
             for p in priorities:
                 point = p.get("point")
                 coords = _coord(point)
                 if coords is None:
                     continue
-                station_id = repository.ensure_station(session, point, *coords)
+                station_id = station_ids.get(point)
+                if station_id is None:
+                    station_id = repository.ensure_station(session, point, *coords)
                 reason = "; ".join(p.get("reasons") or []) or "Routine monitoring"
                 action = "; ".join(p.get("recommended_actions") or [])
                 severity = _severity_from_aqi(p.get("aqi_for_ranking"))
@@ -355,6 +365,36 @@ def query_latest_source_estimates() -> Optional[list]:
             return repository.get_latest_source_estimates(session)
     except Exception as exc:
         logger.warning("query_latest_source_estimates failed: %s", str(exc)[:160])
+        return None
+
+
+def load_stored_snapshot(names) -> Optional[dict]:
+    """Preload the "latest stored row" for many stations in ONE connection.
+
+    Returns ``{"readings": {name: row}, "pollutants": {name: row},
+    "forecasts": {name: [row, ...]}}`` or ``None`` when the database is not
+    configured/unavailable (callers then fall back to live data or per-station
+    queries).
+
+    This exists to kill the N+1 session pattern: the all-points endpoints need
+    the latest reading + pollutant row + forecasts for every point, and doing
+    that per point opened one pooled connection each (~1s to a remote pooler),
+    so 21 points took ~85s. Here it is three queries on one connection.
+    """
+    if not database.is_configured():
+        return None
+    names = list(names)
+    if not names:
+        return {"readings": {}, "pollutants": {}, "forecasts": {}}
+    _ensure_schema()
+    try:
+        with session_scope() as session:
+            readings = {r["station"]: r for r in repository.get_latest_readings(session, names)}
+            pollutants = {r["station"]: r for r in repository.get_latest_pollutant_readings(session, names)}
+            forecasts = repository.get_latest_forecasts_many(session, names)
+        return {"readings": readings, "pollutants": pollutants, "forecasts": forecasts}
+    except Exception as exc:
+        logger.warning("load_stored_snapshot failed: %s", str(exc)[:160])
         return None
 
 

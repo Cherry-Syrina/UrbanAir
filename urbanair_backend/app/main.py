@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -51,6 +52,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("urbanair.api")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _elapsed_ms(start: float) -> float:
+    """Elapsed milliseconds since a ``time.perf_counter()`` reading.
+
+    Used for the coarse per-step timing logs on the all-points endpoints so a
+    slow deployment can be diagnosed without guessing which step stalls."""
+    return round((time.perf_counter() - start) * 1000, 1)
+
+
+def _snapshot_cities(points) -> list:
+    """Distinct trained cities whose AQI/forecast the given points proxy from.
+
+    The all-points endpoints reuse a nearest-city reading for every hotspot and
+    landmark, so only these few cities' stored rows need preloading."""
+    names = set()
+    for point in points:
+        coords = CITY_COORDS.get(point) or sa.CITY_COORDS.get(point)
+        if coords is None:
+            continue
+        city, _ = sa.nearest_known_city(*coords)
+        names.add(city)
+    return sorted(names)
 
 
 def _normalize_origin(origin: str) -> str:
@@ -283,7 +307,14 @@ def _current_from_stored(city: str, stored: dict,
 
 
 @app.get("/api/current/{city}")
-def get_current(city: str):
+def current_endpoint(city: str):
+    # Thin route wrapper: the real logic is get_current(), which the all-points
+    # endpoints also call directly with a preloaded snapshot. Keeping the
+    # snapshot parameter out of the route signature keeps it off the public API.
+    return get_current(city)
+
+
+def get_current(city: str, snapshot: Optional[dict] = None):
     """Returns the most recent AQI reading for a city.
 
     Both live sources are computed when available:
@@ -309,6 +340,21 @@ def get_current(city: str):
     reading either, this returns 503."""
     if city not in CITY_COORDS:
         raise HTTPException(404, f"Unknown city: {city}")
+
+    if snapshot is not None:
+        # Caller preloaded the stored rows for every needed city in ONE
+        # connection (see db.service.load_stored_snapshot). Use it instead of
+        # opening a fresh connection here -- this is what stops the all-points
+        # endpoints from doing 21 x 2 round trips.
+        stored = (snapshot.get("readings") or {}).get(city)
+        if stored is None or stored.get("aqi") is None:
+            raise HTTPException(
+                503,
+                f"No stored reading available for {city} and no live data in "
+                f"this container.",
+            )
+        pollutant_reading = (snapshot.get("pollutants") or {}).get(city)
+        return _current_from_stored(city, stored, pollutant_reading)
 
     live_pollutants = _load_latest_live_pollutants(city)
     ground_aqi_row = _load_latest_ground_aqi(city)
@@ -458,7 +504,7 @@ def _forecast_from_stored(city: str, stored: list) -> dict:
     }
 
 
-def _with_current_aqi(payload: dict, city: str) -> dict:
+def _with_current_aqi(payload: dict, city: str, snapshot: Optional[dict] = None) -> dict:
     """Fill a forecast payload's ``current_aqi`` from the same source
     ``/api/current`` uses, when the forecast itself has none.
 
@@ -466,11 +512,14 @@ def _with_current_aqi(payload: dict, city: str) -> dict:
     so their ``current_aqi`` is None even though ``/api/current`` returns a real
     reading (live measurement, or the stored-observation fallback). Copy that in
     rather than shipping null. If ``/api/current`` has nothing either, the field
-    stays None -- it is never fabricated."""
+    stays None -- it is never fabricated.
+
+    ``snapshot`` (when given) is the preloaded stored-rows dict so this does
+    not open its own database connection."""
     if payload.get("current_aqi") is not None:
         return payload
     try:
-        current = get_current(city)
+        current = get_current(city, snapshot=snapshot)
         payload["current_aqi"] = current.get("aqi")
         payload["current_aqi_origin"] = current.get("data_origin")
     except HTTPException:
@@ -479,7 +528,14 @@ def _with_current_aqi(payload: dict, city: str) -> dict:
 
 
 @app.get("/api/forecast/{city}")
-def forecast(city: str, reference_time: Optional[str] = None, persist: bool = True):
+def forecast_endpoint(city: str, reference_time: Optional[str] = None, persist: bool = True):
+    # Thin route wrapper; see current_endpoint for why the snapshot arg is
+    # internal to the helper function.
+    return forecast(city, reference_time=reference_time, persist=persist)
+
+
+def forecast(city: str, reference_time: Optional[str] = None, persist: bool = True,
+             snapshot: Optional[dict] = None):
     """24/48/72hr forecast, built from the LIVE accumulating history
     (live_history.py) instead of the old frozen Jan-2024 CSV.
 
@@ -501,9 +557,12 @@ def forecast(city: str, reference_time: Optional[str] = None, persist: bool = Tr
     if city_df.empty:
         # No live history in this container. Serve the most recent STORED
         # forecast rows from Supabase instead of failing, clearly marked.
-        stored = db_service.query_latest_forecasts(city)
+        if snapshot is not None:
+            stored = (snapshot.get("forecasts") or {}).get(city)
+        else:
+            stored = db_service.query_latest_forecasts(city)
         if stored:
-            return _with_current_aqi(_forecast_from_stored(city, stored), city)
+            return _with_current_aqi(_forecast_from_stored(city, stored), city, snapshot=snapshot)
         raise HTTPException(
             503,
             f"No live history yet for {city} and no stored forecast in the "
@@ -517,7 +576,7 @@ def forecast(city: str, reference_time: Optional[str] = None, persist: bool = Tr
     # and duplicate-safe via the forecast unique constraint).
     if persist:
         db_service.persist_forecast(city, payload)
-    return _with_current_aqi(payload, city)
+    return _with_current_aqi(payload, city, snapshot=snapshot)
 
 
 @app.get("/api/historical/{city}")
@@ -661,6 +720,7 @@ def enforcement_intelligence():
     if a still-warming-up forecast optimistically predicts improvement.
     `forecast_is_warming_up` on each item tells the frontend whether the
     +24h number should be shown with reduced confidence."""
+    t0 = time.perf_counter()
     try:
         attribution_results = source_attribution_all()
     except HTTPException:
@@ -669,6 +729,17 @@ def enforcement_intelligence():
         # same item shape so the response type (a ranked list) is preserved.
         return _enforcement_from_stored()
 
+    logger.info("enforcement: source attribution %d points in %.0fms",
+                len(attribution_results), _elapsed_ms(t0))
+
+    # Preload every needed city's stored reading + pollutant row + forecasts in
+    # ONE connection. Without this the loop below opened ~5 pooled connections
+    # per point (~105 total) which took ~85s against the remote pooler.
+    t_snap = time.perf_counter()
+    snapshot = db_service.load_stored_snapshot(_snapshot_cities([a["point"] for a in attribution_results]))
+    logger.info("enforcement: stored snapshot load in %.0fms", _elapsed_ms(t_snap))
+
+    t_loop = time.perf_counter()
     priorities = []
     for attr in attribution_results:
         point = attr["point"]
@@ -683,7 +754,7 @@ def enforcement_intelligence():
         # a null current AQI even though /api/current had a real value.
         current_aqi = None
         try:
-            current_aqi = get_current(city_for_aqi).get("aqi")
+            current_aqi = get_current(city_for_aqi, snapshot=snapshot).get("aqi")
         except HTTPException:
             current_aqi = None
 
@@ -696,7 +767,7 @@ def enforcement_intelligence():
         aqi_24h = None
         forecast_is_warming_up = None
         try:
-            fc = forecast(city_for_aqi, persist=False)
+            fc = forecast(city_for_aqi, persist=False, snapshot=snapshot)
         except HTTPException:
             fc = None
         if fc:
@@ -789,8 +860,14 @@ def enforcement_intelligence():
     for i, p in enumerate(priorities):
         p["rank"] = i + 1
 
+    logger.info("enforcement: ranking of %d points in %.0fms",
+                len(priorities), _elapsed_ms(t_loop))
+
     # Persist alerts (hourly, duplicate-safe) when Supabase is configured.
+    t_persist = time.perf_counter()
     db_service.persist_enforcement(priorities)
+    logger.info("enforcement: persist in %.0fms (total %.0fms)",
+                _elapsed_ms(t_persist), _elapsed_ms(t0))
 
     return priorities
 
@@ -918,17 +995,23 @@ def health_advisory_all():
     pattern already used by /api/estimate, with the same distance/label
     fields included so the frontend can show it transparently rather
     than implying false precision."""
+    t_start = time.perf_counter()
+    # Preload stored rows for every proxied city in ONE connection (see
+    # load_stored_snapshot) instead of one connection per point.
+    snapshot = db_service.load_stored_snapshot(_snapshot_cities(sa.CITY_COORDS.keys()))
+    logger.info("health-advisory: stored snapshot load in %.0fms", _elapsed_ms(t_start))
+
     results = []
     for point, (lat, lon) in sa.CITY_COORDS.items():
         nearest_city, dist_km = sa.nearest_known_city(lat, lon)
         try:
-            current = get_current(nearest_city)
+            current = get_current(nearest_city, snapshot=snapshot)
         except HTTPException:
             # nearest trained city has no current reading at all -- skip this
             # point rather than serving a stale/fake one
             continue
         try:
-            fc = forecast(nearest_city, persist=False)
+            fc = forecast(nearest_city, persist=False, snapshot=snapshot)
         except HTTPException:
             # forecast unavailable for this point, but the current-AQI advisory
             # is still useful -- include it with forecast_status="unavailable"
@@ -942,6 +1025,8 @@ def health_advisory_all():
             "distance_to_nearest_city_km": round(dist_km, 2),
             **payload,
         })
+    logger.info("health-advisory: %d points in %.0fms total",
+                len(results), _elapsed_ms(t_start))
     return results
 
 

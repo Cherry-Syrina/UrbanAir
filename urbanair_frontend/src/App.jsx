@@ -17,6 +17,7 @@ import WhatIfInfoPanel from "./components/WhatIfInfoPanel";
 import EnforcementInfoPanel from "./components/EnforcementInfoPanel";
 import SourceAttributionInfoPanel from "./components/SourceAttributionInfoPanel";
 import { api } from "./api";
+import { useResource } from "./useResource";
 
 const TABS = [
   { key: "overview", label: "Overview" },
@@ -49,6 +50,22 @@ const POLLUTANTS = [
   { key: "o3", label: "O3", unit: "µg/m³" },
 ];
 
+// Renders either a settled error state (with Retry) or a loading placeholder.
+// Ensures a failed/timed-out request never leaves the tab stuck on "Loading...".
+function ResourceFallback({ error, label, onRetry }) {
+  if (error) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, color: "var(--text-secondary)", fontSize: 13 }}>
+        <span>Could not load {label}: {error}</span>
+        <button onClick={onRetry} className="refresh-btn" style={{ alignSelf: "flex-start" }}>
+          Retry
+        </button>
+      </div>
+    );
+  }
+  return <span style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading {label}...</span>;
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState("overview");
   const [cities, setCities] = useState([]);
@@ -58,18 +75,19 @@ export default function App() {
   const [forecastData, setForecastData] = useState(null);
   const [historicalData, setHistoricalData] = useState([]);
   const [attributionData, setAttributionData] = useState(null);
-  const [attributionAllData, setAttributionAllData] = useState(null);
-  const [refreshingAttribution, setRefreshingAttribution] = useState(false);
   const [attributionView, setAttributionView] = useState("single"); // "single" | "compare"
   const [whatifPoint, setWhatifPoint] = useState("Delhi");
-  const [enforcementData, setEnforcementData] = useState(null);
-  const [refreshingEnforcement, setRefreshingEnforcement] = useState(false);
   const [healthData, setHealthData] = useState(null);
-  const [healthAllData, setHealthAllData] = useState(null);
-  const [refreshingHealth, setRefreshingHealth] = useState(false);
   const [healthView, setHealthView] = useState("single"); // "single" | "compare"
   const [lastUpdated, setLastUpdated] = useState(null);
   const [loadError, setLoadError] = useState(null);
+
+  // All-points resources. `useResource` de-dupes concurrent loads (so the 60s
+  // refresh can't stack requests while a slow one is in flight) and always
+  // settles `loading`, surfacing `error` instead of an endless spinner.
+  const enforcement = useResource(useCallback(() => api.enforcement(), []));
+  const attributionAll = useResource(useCallback(() => api.sourceAttributionAll(), []));
+  const healthAll = useResource(useCallback(() => api.healthAdvisoryAll(), []));
 
   // Load city list + current AQI for all cities (for the map)
   const loadCities = useCallback(async () => {
@@ -128,58 +146,25 @@ export default function App() {
     loadCityDetail(selectedCity);
   }, [selectedCity, loadCityDetail]);
 
-  // Load enforcement ranking once (covers all points, not city-specific)
-  useEffect(() => {
-    api.enforcement().then(setEnforcementData).catch((e) => console.error(e));
-  }, []);
-
-  const refreshEnforcement = useCallback(() => {
-    setRefreshingEnforcement(true);
-    api.enforcement()
-      .then(setEnforcementData)
-      .catch((e) => console.error(e))
-      .finally(() => setRefreshingEnforcement(false));
-  }, []);
-
-  // Load all-points attribution once, for the "compare" view
-  useEffect(() => {
-    api.sourceAttributionAll().then(setAttributionAllData).catch((e) => console.error(e));
-  }, []);
-
-  const refreshAttribution = useCallback(() => {
-    setRefreshingAttribution(true);
-    api.sourceAttributionAll()
-      .then(setAttributionAllData)
-      .catch((e) => console.error(e))
-      .finally(() => setRefreshingAttribution(false));
-  }, []);
-
-  // Load all-points health advisory once, for the "compare" view
-  useEffect(() => {
-    api.healthAdvisoryAll().then(setHealthAllData).catch((e) => console.error(e));
-  }, []);
-
-  const refreshHealth = useCallback(() => {
-    setRefreshingHealth(true);
-    api.healthAdvisoryAll()
-      .then(setHealthAllData)
-      .catch((e) => console.error(e))
-      .finally(() => setRefreshingHealth(false));
-  }, []);
-
   // Auto-refresh EVERYTHING every 60s so Overview / Source Attribution /
   // Enforcement / Health Advisory / Green Cover never drift out of sync
   // with each other -- this is the single source of truth for "now".
+  // The all-points reloads are de-duped inside useResource, so even if a
+  // previous one is still finishing this cannot stack a second request.
   useEffect(() => {
     const interval = setInterval(() => {
       loadCities();
       loadCityDetail(selectedCity);
-      api.enforcement().then(setEnforcementData).catch((e) => console.error(e));
-      api.sourceAttributionAll().then(setAttributionAllData).catch((e) => console.error(e));
-      api.healthAdvisoryAll().then(setHealthAllData).catch((e) => console.error(e));
+      enforcement.reload({ silent: true });
+      attributionAll.reload({ silent: true });
+      healthAll.reload({ silent: true });
     }, 60000);
     return () => clearInterval(interval);
-  }, [loadCities, loadCityDetail, selectedCity]);
+  }, [loadCities, loadCityDetail, selectedCity, enforcement.reload, attributionAll.reload, healthAll.reload]);
+
+  const refreshEnforcement = useCallback(() => enforcement.reload(), [enforcement.reload]);
+  const refreshAttribution = useCallback(() => attributionAll.reload(), [attributionAll.reload]);
+  const refreshHealth = useCallback(() => healthAll.reload(), [healthAll.reload]);
 
   if (loadError) {
     return (
@@ -371,10 +356,10 @@ export default function App() {
                     No traffic/weather logs found yet. Run traffic_collector.py and weather_collector.py first.
                   </span>
                 )
-              ) : attributionAllData ? (
-                <SourceAttributionCompare data={attributionAllData} onRefresh={refreshAttribution} refreshing={refreshingAttribution} />
+              ) : attributionAll.data ? (
+                <SourceAttributionCompare data={attributionAll.data} onRefresh={refreshAttribution} refreshing={attributionAll.loading} />
               ) : (
-                <span style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading comparison...</span>
+                <ResourceFallback error={attributionAll.error} label="comparison" onRetry={refreshAttribution} />
               )}
             </div>
             <SourceAttributionInfoPanel />
@@ -386,10 +371,10 @@ export default function App() {
         <div style={{ flex: 1, padding: 20, overflowY: "auto" }}>
           <div style={{ display: "flex", gap: 20, alignItems: "flex-start" }}>
             <div style={{ background: "var(--bg-panel)", border: "1px solid var(--border-subtle)", borderRadius: "var(--radius-lg)", padding: 20, maxWidth: 700, flex: "1 1 auto" }}>
-              {enforcementData ? (
-                <EnforcementTable data={enforcementData} onRefresh={refreshEnforcement} refreshing={refreshingEnforcement} />
+              {enforcement.data ? (
+                <EnforcementTable data={enforcement.data} onRefresh={refreshEnforcement} refreshing={enforcement.loading} />
               ) : (
-                <span style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading enforcement ranking...</span>
+                <ResourceFallback error={enforcement.error} label="enforcement ranking" onRetry={refreshEnforcement} />
               )}
             </div>
             <EnforcementInfoPanel />
@@ -430,10 +415,10 @@ export default function App() {
                 ) : (
                   <span style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading health advisory...</span>
                 )
-              ) : healthAllData ? (
-                <HealthAdvisoryCompare data={healthAllData} onRefresh={refreshHealth} refreshing={refreshingHealth} />
+              ) : healthAll.data ? (
+                <HealthAdvisoryCompare data={healthAll.data} onRefresh={refreshHealth} refreshing={healthAll.loading} />
               ) : (
-                <span style={{ color: "var(--text-tertiary)", fontSize: 13 }}>Loading comparison...</span>
+                <ResourceFallback error={healthAll.error} label="comparison" onRetry={refreshHealth} />
               )}
             </div>
             <HealthAdvisoryInfoPanel />
