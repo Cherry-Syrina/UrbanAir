@@ -1,9 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api";
-
-// Simple, permissive recipient check — the backend validates again before
-// handing the address to SMTP.
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+import { sendEmailFlow, isValidEmail } from "../emailFlow";
 
 const REPORTS = [
   { key: "official", label: "Official Report", path: "alertOfficials", field: "report_text" },
@@ -23,7 +20,7 @@ export default function AlertPanel({ point }) {
   const [sending, setSending] = useState(false);
   const [sendStatus, setSendStatus] = useState(null);
 
-  const emailValid = EMAIL_RE.test(toEmail.trim());
+  const emailValid = isValidEmail(toEmail);
   const report = REPORTS.find((r) => r.key === alertType) || REPORTS[0];
 
   // Check once whether the server can actually send mail, so the user gets a
@@ -58,21 +55,16 @@ export default function AlertPanel({ point }) {
 
   const handleSend = async () => {
     setTouched(true);
+    // Guard against invalid recipients AND duplicate submissions while a
+    // request is already pending (`sending` stays true until finally()).
     if (!emailValid || sending) return;
-    setSending(true);
-    setSendStatus(null);
-    try {
-      const data = await api.sendAlert({
-        point,
-        alert_type: alertType,
-        to_email: toEmail.trim(),
-      });
-      setSendStatus({ ok: true, msg: `Sent ${report.label} to ${data.to || toEmail.trim()}` });
-    } catch (e) {
-      setSendStatus({ ok: false, msg: e.message || "Failed to send email" });
-    } finally {
-      setSending(false);
-    }
+    await sendEmailFlow({
+      sendAlert: api.sendAlert,
+      payload: { point, alert_type: alertType, to_email: toEmail.trim() },
+      reportLabel: report.label,
+      setSending,
+      setSendStatus,
+    });
   };
 
   return (

@@ -7,27 +7,38 @@ const RAW_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 const BASE = RAW_BASE.replace(/\/+$/, "");
 
 async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  if (!res.ok) {
-    // Prefer the backend's `detail` message (e.g. "SMTP is not configured on
-    // the server") so callers can show it verbatim; fall back to the status.
-    let detail = `API ${path} failed: ${res.status}`;
-    try {
-      const body = await res.json();
-      if (body && body.detail) {
-        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? 20000;
+  const timeoutId = setTimeout(() => controller.abort("Request timed out"), timeoutMs);
+
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      ...options,
+    });
+    if (!res.ok) {
+      let detail = `API ${path} failed: ${res.status}`;
+      try {
+        const body = await res.json();
+        if (body && body.detail) {
+          detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+        }
+      } catch {
       }
-    } catch {
-      // non-JSON error body — keep the generic message
+      const err = new Error(detail);
+      err.status = res.status;
+      throw err;
     }
-    const err = new Error(detail);
-    err.status = res.status;
+    return res.json();
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error("Request timed out. Please try again.");
+    }
     throw err;
+  } finally {
+    clearTimeout(timeoutId);
   }
-  return res.json();
 }
 
 export const api = {
@@ -60,5 +71,7 @@ export const api = {
   alertOfficials: (point) => request(`/alerts/officials/${encodeURIComponent(point)}`),
   alertPublic: (point) => request(`/alerts/public/${encodeURIComponent(point)}`),
   sendAlert: (payload) =>
-    request("/alerts/send", { method: "POST", body: JSON.stringify(payload) }),
+    // Backend SMTP timeout is 10s; content generation + pool queries add a
+    // little on top, so allow 30s total before aborting (still bounded).
+    request("/alerts/send", { method: "POST", body: JSON.stringify(payload), timeoutMs: 30000 }),
 };

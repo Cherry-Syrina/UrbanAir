@@ -111,6 +111,24 @@ class TestAlertSend(AlertEndpointsTestCase):
         self.assertEqual(resp.status_code, 503)
         self.assertIn("SMTP", resp.json()["detail"])
 
+    def test_timeout_is_mapped_to_503(self):
+        client, main = self._client()
+        with patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications, "send_email",
+                             side_effect=TimeoutError("timeout")):
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn("timed out", resp.json()["detail"])
+
+    def test_smtp_generic_failure_returns_500(self):
+        client, main = self._client()
+        with patch.object(main, "_get_alert_context", side_effect=_context), \
+                patch.object(main.notifications, "send_email",
+                             side_effect=Exception("some smtp error")):
+            resp = self._send(client)
+        self.assertEqual(resp.status_code, 500)
+        self.assertIn("Failed to send", resp.json()["detail"])
+
     def test_successful_send_reports_recipient_and_subject(self):
         client, main = self._client()
         with patch.object(main, "_get_alert_context", side_effect=_context), \

@@ -42,7 +42,7 @@ def send_email(to_email, subject, body):
     msg["From"] = SMTP_EMAIL
     msg["To"] = to_email
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10) as server:
         server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
         server.sendmail(SMTP_EMAIL, [to_email], msg.as_string())
 
