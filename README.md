@@ -485,4 +485,3 @@ bounds:
 
 Released under the [MIT License](LICENSE).
 
-© 2026 UpmaShukla276.
